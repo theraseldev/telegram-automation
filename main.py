@@ -3240,11 +3240,12 @@ def send_personal_message():
         access_hash = safe_int(data.get('access_hash'), 0) or None
         username = clean_str(data.get('username')) or None
         message = clean_str(data.get('message'))
+        media_path = clean_str(data.get('media_path'))
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
-        if not target_id or not message:
-            return jsonify({'success': False, 'error': 'Target and message required'}), 400
+        if not target_id or (not message and not media_path):
+            return jsonify({'success': False, 'error': 'Target and message (or a photo/video) required'}), 400
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -3265,14 +3266,14 @@ def send_personal_message():
                 async def _deliver():
                     if username:
                         # Username is the most reliable peer — Telegram resolves it directly
-                        return await client.send_message(username, message)
+                        return await _deliver_media_or_text(client, username, message, media_path)
                     if access_hash:
                         # InputPeerUser avoids an entity lookup
                         peer = types.InputPeerUser(user_id=target_id, access_hash=access_hash)
-                        return await client.send_message(peer, message)
+                        return await _deliver_media_or_text(client, peer, message, media_path)
                     # Last resort: warm the dialog cache, then send by id
                     await client.get_dialogs(limit=1)
-                    return await client.send_message(target_id, message)
+                    return await _deliver_media_or_text(client, target_id, message, media_path)
 
                 try:
                     return await _deliver()
@@ -4250,12 +4251,13 @@ def send_dm():
             clean_str(u).lstrip('@') for u in (data.get('usernames') or []) if clean_str(u)
         ])
         message = clean_str(data.get('message'))
+        media_path = clean_str(data.get('media_path'))
         delay = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
-        if not usernames or not message:
-            return jsonify({'success': False, 'error': 'Usernames and message required'}), 400
+        if not usernames or (not message and not media_path):
+            return jsonify({'success': False, 'error': 'Usernames and a message (or photo/video) required'}), 400
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -4288,7 +4290,7 @@ def send_dm():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await client.send_message(uname, message)
+                                        await _deliver_media_or_text(client, uname, message, media_path)
                                         result['sent'] += 1
                                         task_run_update(task_key, sent=result['sent'])
                                         await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
@@ -4360,10 +4362,11 @@ def send_dm_multi():
         account_ids = dedupe_preserve([safe_int(x, 0) for x in (data.get('account_ids') or []) if safe_int(x, 0)])
         usernames   = dedupe_preserve([clean_str(u).lstrip('@') for u in (data.get('usernames') or []) if clean_str(u)])
         message     = clean_str(data.get('message'))
+        media_path  = clean_str(data.get('media_path'))
         delay       = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
 
-        if not account_ids or not usernames or not message:
-            return jsonify({'success': False, 'error': 'Accounts, usernames, and message required'}), 400
+        if not account_ids or not usernames or (not message and not media_path):
+            return jsonify({'success': False, 'error': 'Accounts, usernames, and a message (or photo/video) required'}), 400
 
         # Validate every account up front: the UI must not be told "started"
         # while an unowned/disconnected account silently does nothing.
@@ -4413,7 +4416,7 @@ def send_dm_multi():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await client.send_message(uname, message)
+                                        await _deliver_media_or_text(client, uname, message, media_path)
                                         result['sent'] += 1
                                         await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
                                         break
@@ -4504,13 +4507,17 @@ def dm_campaign():
         messages = [clean_str(m) for m in (data.get('messages') or []) if clean_str(m)]
         delay = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
         personalize = safe_bool(data.get('personalize'), False)
+        media_path = clean_str(data.get('media_path'))
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
         if not targets:
             return jsonify({'success': False, 'error': 'No targets provided'}), 400
-        if not messages:
+        if not messages and not media_path:
             return jsonify({'success': False, 'error': 'No messages provided'}), 400
+        if media_path and not messages:
+            # Media-only campaign: the caption is empty, no template needed.
+            messages = ['']
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -4562,7 +4569,7 @@ def dm_campaign():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await client.send_message(username, msg)
+                                        await _deliver_media_or_text(client, username, msg, media_path)
                                         result['sent'] += 1
                                         task_run_update(task_id, sent=result['sent'], skipped=result['skipped'])
                                         await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
@@ -8206,6 +8213,23 @@ def run_auto_video_post_scheduler():
 # ═══════════════════════════════════════════════════════════════════════════════
 # ─── SAVED TARGETS + APP CONFIG + DATABASE HEALTH ─────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
+
+async def _deliver_media_or_text(client, peer, text, media_path=None):
+    """Send plain text, or a device-uploaded photo/video using the text as caption.
+
+    Used by every messaging tool (personal chat, bulk DM, DM campaign, channel
+    post) so a single upload path covers them all. Existing text-only behaviour
+    is unchanged when media_path is empty.
+    """
+    media_path = (media_path or '').strip()
+    if media_path:
+        if not os.path.exists(media_path):
+            raise FileNotFoundError(
+                'The uploaded photo/video is no longer on the server (temporary disk). '
+                'Re-upload it and try again.')
+        return await client.send_file(peer, media_path, caption=(text or None))
+    return await client.send_message(peer, text)
+
 
 @app.route('/bot/upload_media', methods=['POST'])
 @login_required
