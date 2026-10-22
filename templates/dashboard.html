@@ -626,6 +626,13 @@ input[type=file].form-control{padding:9px}
           <input type="text" class="form-control" id="broadcastCaption" placeholder="Caption">
         </div>
         <div class="form-group">
+          <label>📤 Upload photo / video from device</label>
+          <input type="file" class="form-control" id="broadcastMediaFile"
+                 accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                 onchange="uploadMessagingMedia(this, 'broadcastContent', 'broadcastType', 'broadcastMediaPreview')">
+          <div id="broadcastMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
+        </div>
+        <div class="form-group">
           <label>Delay between ROUNDS (seconds)</label>
           <input type="number" class="form-control" id="broadcastDelay" value="3" min="1">
         </div>
@@ -683,6 +690,13 @@ input[type=file].form-control{padding:9px}
         <div class="form-group">
           <label>Message / URL</label>
           <textarea class="form-control" id="schedContent" placeholder="Enter message"></textarea>
+        </div>
+        <div class="form-group">
+          <label>📤 Upload photo / video from device</label>
+          <input type="file" class="form-control" id="schedMediaFile"
+                 accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                 onchange="uploadMessagingMedia(this, 'schedContent', 'schedType', 'schedMediaPreview')">
+          <div id="schedMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
         </div>
         <div class="form-group">
           <label>Schedule Date & Time (local time)</label>
@@ -1689,6 +1703,16 @@ input[type=file].form-control{padding:9px}
         <div class="form-group">
           <label>Message</label>
           <textarea class="form-control" id="chanPostContent" placeholder="Your post content..." style="min-height:120px"></textarea>
+        </div>
+        <div class="form-group">
+          <label>📤 Attach photo / video from device
+            <span style="font-size:10px;color:#8b949e">(the text above becomes the caption)</span></label>
+          <input type="file" class="form-control" id="chanPostMediaFile"
+                 accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                 onchange="uploadMessagingMedia(this, null, null, 'chanPostMediaPreview', 'chanPostMediaPath', 'chanPostMediaType')">
+          <input type="hidden" id="chanPostMediaPath">
+          <input type="hidden" id="chanPostMediaType" value="text">
+          <div id="chanPostMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
         </div>
         <div class="two-col">
           <div class="form-group">
@@ -4515,19 +4539,73 @@ async function deleteAutoVideo(id) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// ─── DEVICE MEDIA UPLOAD (pick a photo/video → stored server path) ──────────
+// ════════════════════════════════════════════════════════════════════════════
+async function uploadMessagingMedia(input, targetFieldId, typeSelectId, previewId, hiddenPathId, hiddenTypeId) {
+  const preview = previewId ? document.getElementById(previewId) : null;
+  const file = input.files && input.files[0];
+  if (!file) { if (preview) preview.innerHTML = ''; return; }
+
+  const maxMb = (typeof APP_LIMITS !== 'undefined' && APP_LIMITS && APP_LIMITS.max_upload_mb) || 500;
+  if (maxMb && file.size > maxMb * 1048576) {
+    if (preview) preview.innerHTML = `❌ ${file.name} is ${(file.size / 1048576).toFixed(1)} MB — the limit is ${maxMb} MB.`;
+    input.value = '';
+    return;
+  }
+
+  if (preview) preview.innerHTML = `⏳ Uploading <b>${file.name}</b> (${(file.size / 1048576).toFixed(2)} MB)…`;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch('/bot/upload_media', { method: 'POST', body: fd, credentials: 'same-origin' });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || !data.success) throw new Error((data && data.error) || ('HTTP ' + res.status));
+
+    const f = data.file;
+    if (targetFieldId) { const el = document.getElementById(targetFieldId); if (el) el.value = f.path; }
+    if (hiddenPathId)  { const el = document.getElementById(hiddenPathId);  if (el) el.value = f.path; }
+    if (hiddenTypeId)  { const el = document.getElementById(hiddenTypeId);  if (el) el.value = f.kind; }
+    if (typeSelectId)  { const sel = document.getElementById(typeSelectId); if (sel) sel.value = f.kind; }
+
+    if (preview) {
+      const thumb = f.kind === 'photo'
+        ? `<img src="${f.url}" style="max-width:220px;max-height:160px;border-radius:8px;margin-top:6px;display:block">`
+        : `<video src="${f.url}" controls preload="metadata" style="max-width:260px;max-height:180px;border-radius:8px;margin-top:6px;display:block"></video>`;
+      preview.innerHTML = `✅ ${f.kind === 'photo' ? 'Photo' : 'Video'} ready — ${f.original_name} (${(f.size / 1048576).toFixed(2)} MB)`
+        + `<br><code style="font-size:11px;word-break:break-all">${f.path}</code>${thumb}`
+        + (f.persistent ? ''
+           : `<div style="font-size:11px;color:#d29922;margin-top:4px">⚠️ This server's disk is temporary — if the service restarts you must upload it again.</div>`);
+    }
+  } catch (e) {
+    if (preview) preview.innerHTML = `❌ Upload failed: ${e.message}`;
+  } finally {
+    input.value = '';
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ─── CHANNEL POST SCHEDULER JS ──────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════════════════════
 async function scheduleChanPost() {
   const account_id      = document.getElementById('chanPostAccount').value;
   const channel         = document.getElementById('chanPostChannel').value.trim();
   const content         = document.getElementById('chanPostContent').value.trim();
+  const media_path      = ((document.getElementById('chanPostMediaPath') || {}).value || '').trim();
+  const message_type    = media_path ? (((document.getElementById('chanPostMediaType') || {}).value) || 'photo') : 'text';
   const scheduled_at    = document.getElementById('chanPostDateTime').value;
   const repeat_interval = parseInt(document.getElementById('chanPostRepeat').value) || 0;
-  if (!channel || !content || !scheduled_at) { showAlert('chanPostAlert', 'Fill all required fields', 'error'); return; }
+  if (!channel || (!content && !media_path) || !scheduled_at) { showAlert('chanPostAlert', 'Fill all required fields', 'error'); return; }
   const data = await apiCall('/bot/channel_post/create', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ account_id, channel, content, scheduled_at, repeat_interval }) });
+    body: JSON.stringify({ account_id, channel, content, media_path, message_type, scheduled_at, repeat_interval }) });
   showAlert('chanPostAlert', data ? (data.success ? data.message : data.error) : 'Error', data?.success ? 'success' : 'error');
-  if (data?.success) { loadChanPosts(); document.getElementById('chanPostContent').value = ''; }
+  if (data?.success) {
+    loadChanPosts();
+    document.getElementById('chanPostContent').value = '';
+    const mp = document.getElementById('chanPostMediaPath'); if (mp) mp.value = '';
+    const mt = document.getElementById('chanPostMediaType'); if (mt) mt.value = 'text';
+    const pv = document.getElementById('chanPostMediaPreview'); if (pv) pv.innerHTML = '';
+  }
 }
 
 async function loadChanPosts() {
@@ -4986,6 +5064,13 @@ function closeSidebar() {
           <label for="gsDelay">Delay between destinations (seconds)</label>
           <input type="number" class="form-control" id="gsDelay" value="5" min="1">
         </div>
+      </div>
+      <div class="form-group">
+        <label for="gsMediaFile">📤 Upload photo / video from device</label>
+        <input type="file" class="form-control" id="gsMediaFile"
+               accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+               onchange="uploadMessagingMedia(this, 'gsMedia', 'gsMessageType', 'gsMediaPreview')">
+        <div id="gsMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
       </div>
       <div class="three-col">
         <div class="form-group">
