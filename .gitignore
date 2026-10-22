@@ -1,0 +1,38 @@
+# ── Secrets & local data: NEVER commit these ────────────────────────────────
+.env
+*.env
+!.env.example
+instance/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+telegram_automation.db
+
+# ── Telegram session files / backups (full account takeover material) ───────
+*.session
+*.session-journal
+sessions/
+tgbot_backup*.json
+
+# ── Uploaded / generated media (ephemeral on Railway anyway) ───────────────
+auto_post_media/
+uploads/
+media/
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+
+# ── Editors / OS ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

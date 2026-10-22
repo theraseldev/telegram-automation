@@ -1,0 +1,140 @@
+================================================================================
+ TEST_RESULTS.txt — MR ADS TG AUTOMATION
+ Suite: project/tests/test_suite.py     Executed: 2026-10-09
+ Environment: Python 3.12.2 (venv), SQLite temp DB, Telegram replaced by an
+              in-process fake (FakeTelegram). NO live Telegram account,
+              NO Railway, NO Neon connection was used.
+================================================================================
+
+RESULT:  115 passed in 46.92s
+Raw log: project/_evidence/pytest.txt
+
+Command actually run:
+    python -m pytest tests/test_suite.py -q --no-header -p no:warnings
+
+
+--------------------------------------------------------------------------------
+WHAT WAS REALLY EXECUTED (all PASS unless stated)
+--------------------------------------------------------------------------------
+
+A. Syntax / import checks
+  1. main.py AST parse ............................................ PASS
+  2. Application import + startup schema init (tables created,
+     migration ran, admin ensured, recovery ran) ................. PASS
+
+B. Response-contract tests (static parse of the real templates)
+  3. Every endpoint called by templates/dashboard.html exists in
+     the Flask url_map (>50 endpoints checked) ................... PASS
+  4. templates/admin.html calls only existing endpoints and uses
+     /bot/admin/* (regression guard for the broken panel) ........ PASS
+  5. No duplicate element ids in dashboard.html .................. PASS
+  6. Auto Video Poster channel-limit label is not hardcoded ....... PASS
+
+C. Auth / access control
+  7. /bot/* without a session -> 401 JSON with login_required ...... PASS
+  8. Public /register is disabled -> 403 registration_disabled .... PASS
+  9. Wrong password -> 401 ........................................ PASS
+ 10. Banned user login -> 403 ..................................... PASS
+ 11. Normal user hitting admin routes -> 403 ...................... PASS
+ 12. /bot/db_health reports the backend and leaks no secrets ...... PASS
+ 13. /bot/app_config returns the shared limits .................... PASS
+
+D. NoneType / invalid-input regressions (the reported crash class)
+ 14. safe_int over None, '', '   ', 'abc', [], booleans, floats,
+     bounded values ............................................. PASS (4 tests)
+ 15. Empty JSON body {} posted to 10 messaging/video endpoints ->
+     HTTP < 500 with success:false .............................. PASS (10 tests)
+ 16. All-None payload to the same 10 endpoints -> no 500 .......... PASS (10 tests)
+ 17. Auto Video create without channels -> 400 .................... PASS
+ 18. Unknown /bot route -> JSON 404 ............................... PASS
+ 19. Unexpected internal error -> JSON 500, success:false ......... PASS
+ 20. Upload above MAX_CONTENT_LENGTH -> JSON 413 .................. PASS
+ 21. Error responses contain no session string and no api_hash .... PASS
+
+E. Auto Video Poster
+ 22. Channel limit identical in UI and backend: 1, 10, 11, 50 -> 200;
+     51 -> 400 with the configured maximum ....................... PASS (5 tests)
+ 23. Saved Messages scan persists message ids + queue state to the DB PASS
+ 24. Invalid channel rejected; ZIP with no videos rejected;
+     ZIP source without a file rejected .......................... PASS (3 tests)
+ 25. A round posts to every channel, advances each queue, sets
+     next_run_at / posted_at ..................................... PASS
+ 26. Different channels get different videos in the same round .... PASS
+ 27. One failing channel does not block the others; its queue does
+     not advance; campaign stays running ......................... PASS
+ 28. A dead Saved Message is skipped for that channel only (posted
+     2, skipped 1) and is not retried forever .................... PASS
+ 29. FloodWait honoured, then the channel is retried successfully . PASS
+ 30. Missing ZIP media -> paused + needs_reupload + clear message . PASS
+ 31. Pause / resume / delete lifecycle; campaign list exposes
+     posted/failed/skipped/rounds/available_videos ................ PASS
+ 32. Resume refused with a clear 400 when the source is empty ..... PASS
+ 33. ZIP extraction: unicode kept, empty file skipped, path
+     traversal neutralised ....................................... PASS
+ 34. Restart recovery resets a stuck 'posting' campaign ........... PASS
+
+F. Messaging campaigns
+ 35. Broadcast success -> status completed, sent 2, durable
+     progress reported ........................................... PASS
+ 36. Broadcast with one failure -> 'partial', failed 1, per-target
+     errors returned ............................................. PASS
+ 37. Broadcast all-fail -> 'failed' (never 'completed') ........... PASS
+ 38. Broadcast FloodWait -> target reported as skipped, other
+     targets still sent .......................................... PASS
+ 39. Broadcast duplicate recipient -> sent once ................... PASS
+ 40. Second campaign on a busy account -> 409 ..................... PASS
+ 41. Progress readable after losing in-memory state (durable) ..... PASS
+ 42. DM campaign deduplicates targets, personalises {name},
+     persists progress ........................................... PASS
+ 43. DM campaign per-target failure -> partial .................... PASS
+ 44. Multi-account DM rejects unusable accounts with 400 .......... PASS
+ 45. Multi-account DM splits work and reports durable progress .... PASS
+ 46. DM campaign without account_id -> 400 ........................ PASS
+ 47. Broadcast entity-resolution failure surfaces an error and
+     does not advance the counter ................................ PASS
+
+G. Scheduled broadcasting
+ 48. Empty body / bad date / past date / missing field -> 400 ..... PASS
+ 49. Future time with 'Z' accepted; non-numeric repeat values
+     treated as 0 without crashing; duplicates removed ........... PASS
+ 50. Scheduled list survives a corrupt legacy groups value ........ PASS
+ 51. Recovery: stuck 'running' with 0 sent -> pending; with
+     sent>0 -> interrupted ....................................... PASS
+ 52. Repeat arithmetic (0 = infinite, N = N runs total) .......... PASS (6 cases)
+
+H. Database / persistence / platform
+ 53. DATABASE_URL normalisation (postgres://, missing sslmode,
+     duplicate sslmode, sqlite pass-through, empty) .............. PASS
+ 54. Schema migration adds a missing column, then is a no-op on the
+     second run (idempotent) ..................................... PASS
+ 55. All 11 new campaign columns + user.is_banned/last_login_at
+     exist on the live schema .................................... PASS
+ 56. Ban flag really persists and is shown in the admin user list .. PASS
+ 57. Saved targets round-trip; duplicates not re-added ............ PASS
+ 58. Legacy SQLite import is disabled by default .................. PASS
+
+I. Helpers
+ 59. parse_datetime_utc (naive, Z, invalid, empty, None) .......... PASS
+ 60. dedupe_preserve / clean_str_list ............................. PASS
+ 61. parse_channel_target: @user, user, t.me/user, t.me/user/123,
+     t.me/+invite, joinchat, t.me/c/<id>/<msg>, numeric id, and
+     rejection of malformed input ................................ PASS (14 cases)
+ 62. friendly_telegram_error wording (rate limit / admin / private) PASS
+ 63. redact() hides secrets ....................................... PASS
+
+
+--------------------------------------------------------------------------------
+NOT LIVE-TESTED  (requires a live environment — NOT claimed as passing)
+--------------------------------------------------------------------------------
+ N1. Any real Telegram API call: joining, scraping, adding members, reacting,
+     viewing stories, real broadcast/DM/forward delivery, real channel posting.
+ N2. Real Auto Video Poster posting to real channels, including posting from
+     real Saved Messages and invite-link channel resolution.
+ N3. Railway deployment, healthcheck, restart behaviour and recovery on Railway.
+ N4. Neon PostgreSQL connection, real column migration on PostgreSQL, and the
+     legacy SQLite -> PostgreSQL import path.
+ N5. Browser-level UI testing (all frontend verification here is static:
+     template parsing + route contract + JS syntax check), plus visual checks
+     on real mobile/tablet devices.
+ N6. AI Auto-Reply against a real AI provider (OpenAI/Gemini keys).
+ N7. Load/concurrency behaviour with many simultaneous campaigns.
