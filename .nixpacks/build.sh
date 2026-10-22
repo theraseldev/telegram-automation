@@ -1,0 +1,14 @@
+docker build /out -f /out/.nixpacks/Dockerfile -t e30efafc-a6e3-4f43-8733-3f51ad777155 --build-arg ADMIN_PASSWORD=MRADS412 --build-arg ALLOW_REGISTRATION=0 --build-arg BACKGROUND_JOBS_ENABLED=1 --build-arg DATABASE_URL=postgresql://neondb_owner:npg_ZFJhKcfdae59@ep-odd-rice-b4nnknk0-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require --build-arg MAX_AUTO_POST_CHANNELS=50000 --build-arg MAX_UPLOAD_MB=100000 --build-arg MIGRATE_SQLITE=0 --build-arg NIXPACKS_METADATA=python,postgres --build-arg PIP_DEFAULT_TIMEOUT=100 --build-arg PIP_DISABLE_PIP_VERSION_CHECK=1 --build-arg PIP_NO_CACHE_DIR=1 --build-arg PYTHONDONTWRITEBYTECODE=1 --build-arg PYTHONFAULTHANDLER=1 --build-arg PYTHONHASHSEED=random --build-arg PYTHONUNBUFFERED=1 --build-arg RAILWAY_ENVIRONMENT=production --build-arg RAILWAY_ENVIRONMENT_ID=8c78cef3-732e-46b7-b825-d19a4d8a2541 --build-arg RAILWAY_ENVIRONMENT_NAME=production --build-arg RAILWAY_GIT_AUTHOR=vvbc918-maker --build-arg RAILWAY_GIT_BRANCH=main --build-arg RAILWAY_GIT_COMMIT_MESSAGE=Broadcast: close stranded pre-upgrade campaigns instead of firing them on boot
+
+Follow-on to f492efd. The durable scheduler resumes 'running' campaigns from the
+database, which is what makes a 4-hour repeat survive a restart. But rows the OLD
+in-memory loop left behind are also 'running' with no round bookkeeping, so the
+first tick after this deploy would have fired an unexpected full round at every
+group those campaigns list — with no way to know which round they had reached.
+
+close_stranded_legacy_campaigns() runs once at scheduler startup and closes any
+'running' row with a NULL task_key. Legitimate campaigns always carry
+'broadcast:<id>', and the route now writes task_key in the SAME commit as the row
+(flush + single commit) so a freshly started campaign can never look stranded.
+
+Tests: 3 new, 189 passed. --build-arg RAILWAY_GIT_COMMIT_SHA=c6fa2ed51134b9e1fa4c602c78300f40f6925615 --build-arg RAILWAY_GIT_REPO_NAME=probable-tribble --build-arg RAILWAY_GIT_REPO_OWNER=vvbc918-maker --build-arg RAILWAY_PRIVATE_DOMAIN=probable-tribble.railway.internal --build-arg RAILWAY_PROJECT_ID=e2162134-c6a8-4763-9be9-554609bd9cd7 --build-arg RAILWAY_PROJECT_NAME=incredible-tranquility --build-arg RAILWAY_PUBLIC_DOMAIN=probable-tribble-production-c360.up.railway.app --build-arg RAILWAY_SERVICE_ID=b05abbb7-10b5-4615-868f-e4d5c16a4b8d --build-arg RAILWAY_SERVICE_NAME=probable-tribble --build-arg RAILWAY_SERVICE_PROBABLE_TRIBBLE_URL=probable-tribble-production-c360.up.railway.app --build-arg RAILWAY_STATIC_URL=probable-tribble-production-c360.up.railway.app --build-arg SAVED_MESSAGES_SCAN_LIMIT=50000 --build-arg SECRET_KEY=Ej7w50dnnr9IQwFzRjY0IJs8_00QYgyJWQFKLlGFfdb4jrfGkt84w80RzASi56P3 --build-arg STALE_TASK_MINUTES=30 --build-arg TELEGRAM_API_HASH=88f2149b2465f682d84b649fa6494ab0 --build-arg TELEGRAM_API_ID=37051301
