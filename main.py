@@ -1809,6 +1809,12 @@ def login():
         return redirect(url_for('dashboard'))
     if request.method == 'POST':
         username = clean_str(request.form.get('username'))
+        # The account row is always 'admin' (ADMIN_USERS, the admin panel and the
+        # boot-time recovery all key off that exact name), but operators sign in
+        # as "MRADS" — treat it as an alias instead of renaming the row, which
+        # would make the app recreate a second 'admin' account on the next boot.
+        if username.lower() in ('mrads', 'mrads_tg', 'mradstg'):
+            username = 'admin'
         password = request.form.get('password') or ''
         try:
             user = User.query.filter_by(username=username).first()
