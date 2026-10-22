@@ -782,7 +782,14 @@ input[type=file].form-control{padding:9px}
         <div class="chat-messages" id="chatMessages">
           <div style="text-align:center;color:#8b949e;font-size:13px;padding:20px"><span class="spinner"></span> Loading messages...</div>
         </div>
+        <div id="personalMediaPreview" style="padding:6px 13px 0;font-size:12px;color:#8b949e"></div>
+        <input type="file" id="personalMediaFile" accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v" style="display:none"
+               onchange="uploadMessagingMedia(this, null, null, 'personalMediaPreview', 'personalMediaPath')">
+        <input type="hidden" id="personalMediaPath">
         <div class="chat-win-input">
+          <button type="button" id="btnPersonalAttach" title="Attach a photo or video from this device"
+                  onclick="document.getElementById('personalMediaFile').click()"
+                  style="background:rgba(143,160,191,.18);color:var(--text);padding:9px 12px">📎</button>
           <textarea id="personalMessage" placeholder="Type a message... (Enter to send, Shift+Enter for new line)" rows="1"
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendPersonalMsg()}"></textarea>
           <button id="btnPersonalSend" onclick="sendPersonalMsg()">Send ➤</button>
@@ -823,6 +830,13 @@ input[type=file].form-control{padding:9px}
         <div class="form-group">
           <label>Message</label>
           <textarea class="form-control" id="dmMessage" placeholder="Enter your message..." style="min-height:100px"></textarea>
+        </div>
+        <div class="form-group">
+          <label>📤 Upload photo / video from device</label>
+          <input type="file" class="form-control" id="dmMediaFile" accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                 onchange="uploadMessagingMedia(this, null, null, 'dmMediaPreview', 'dmMediaPath')">
+          <input type="hidden" id="dmMediaPath">
+          <div id="dmMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
         </div>
         <div class="form-group">
           <label>Delay (min 3s)</label>
@@ -884,6 +898,13 @@ input[type=file].form-control{padding:9px}
           <div class="form-group"><textarea class="form-control msg-template" placeholder="Hello {name}, check this out!"></textarea></div>
         </div>
         <button class="btn btn-sm btn-gray" onclick="addMsgTemplate()">+ Add Message</button>
+        <div class="form-group" style="margin-top:14px">
+          <label>📤 Upload photo / video from device</label>
+          <input type="file" class="form-control" id="campaignMediaFile" accept="image/*,video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                 onchange="uploadMessagingMedia(this, null, null, 'campaignMediaPreview', 'campaignMediaPath')">
+          <input type="hidden" id="campaignMediaPath">
+          <div id="campaignMediaPreview" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -2936,7 +2957,8 @@ async function sendPersonalMsg() {
   const accountId = document.getElementById('personalAccount').value;
   const ta = document.getElementById('personalMessage');
   const message = ta.value.trim();
-  if (!message) return;
+  const mediaPath = ((document.getElementById('personalMediaPath') || {}).value || '').trim();
+  if (!message && !mediaPath) return;
   const btn = document.getElementById('btnPersonalSend');
   btn.disabled = true; btn.textContent = '...';
   try {
@@ -2946,16 +2968,20 @@ async function sendPersonalMsg() {
         target_id: selectedChatId,
         access_hash: selectedChatAccessHash,
         username: selectedChatUsername,
-        message
+        message,
+        media_path: mediaPath
       }) });
     const data = await r.json();
     if (data.success) {
       ta.value = '';
+      const mpEl = document.getElementById('personalMediaPath'); if (mpEl) mpEl.value = '';
+      const pvEl = document.getElementById('personalMediaPreview'); if (pvEl) pvEl.innerHTML = '';
       // Append optimistically, then reload
       const area = document.getElementById('chatMessages');
       const now = new Date();
       const time = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
-      const txt = message.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+      const shownText = message || '📎 Media';
+      const txt = shownText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');
       area.innerHTML += `<div class="msg-bubble sent">${txt}<div class="msg-time">${time}</div></div>`;
       area.scrollTop = area.scrollHeight;
     } else {
@@ -3089,22 +3115,23 @@ async function sendBulkDMs() {
   const mode     = document.getElementById('dmMode').value;
   const usernames= document.getElementById('dmUsernames').value.split('\n').map(u => u.trim()).filter(u => u);
   const message  = document.getElementById('dmMessage').value.trim();
+  const mediaPath = ((document.getElementById('dmMediaPath') || {}).value || '').trim();
   const delay    = Math.max(3, parseInt(document.getElementById('dmDelay').value) || 5);
-  if (!usernames.length || !message) { showAlert('dmAlert', 'Enter usernames and message', 'error'); return; }
+  if (!usernames.length || (!message && !mediaPath)) { showAlert('dmAlert', 'Enter usernames and a message (or attach a photo/video)', 'error'); return; }
 
   if (mode === 'multi') {
     const selected = [...document.getElementById('dmMultiAccounts').selectedOptions].map(o => parseInt(o.value));
     if (!selected.length) { showAlert('dmAlert', 'Select at least one account', 'error'); return; }
     showAlert('dmAlert', `🚀 Distributing ${usernames.length} users across ${selected.length} accounts...`, 'info');
     const data = await apiCall('/bot/send_dm_multi', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ account_ids: selected, usernames, message, delay }) });
+      body: JSON.stringify({ account_ids: selected, usernames, message, media_path: mediaPath, delay }) });
     showAlert('dmAlert', data ? (data.success ? data.message : (data.error||'Failed')) : 'Request failed', data?.success ? 'success' : 'error');
   } else {
     const accountId = document.getElementById('dmAccount').value;
     if (!accountId) { showAlert('dmAlert', 'Select an account', 'error'); return; }
     showAlert('dmAlert', `Sending DMs to ${usernames.length} users...`, 'info');
     const data = await apiCall('/bot/send_dm', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ account_id: accountId, usernames, message, delay }) });
+      body: JSON.stringify({ account_id: accountId, usernames, message, media_path: mediaPath, delay }) });
     showAlert('dmAlert', data ? (data.success ? data.message : (data.error||'Failed')) : 'Request failed', data?.success ? 'success' : 'error');
   }
 }
@@ -3123,12 +3150,13 @@ async function startCampaign() {
   const messages = [...document.querySelectorAll('.msg-template')].map(t => t.value.trim()).filter(m => m);
   const delay = Math.max(3, parseInt(document.getElementById('campaignDelay').value) || 5);
   const personalize = document.getElementById('campaignPersonalize').checked;
+  const mediaPath = ((document.getElementById('campaignMediaPath') || {}).value || '').trim();
   if (!rawTargets.length) { showAlert('campaignAlert', 'Enter target usernames', 'error'); return; }
-  if (!messages.length) { showAlert('campaignAlert', 'Enter at least one message template', 'error'); return; }
+  if (!messages.length && !mediaPath) { showAlert('campaignAlert', 'Enter at least one message template (or attach a photo/video)', 'error'); return; }
   const targets = rawTargets.map(u => ({ username: u.lstrip ? u.replace(/^@/, '') : u.replace(/^@/, '') }));
   showAlert('campaignAlert', `Starting campaign for ${targets.length} targets...`, 'info');
   const r = await fetch('/bot/dm_campaign', { method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ account_id: accountId, targets, messages, delay, personalize }) });
+    body: JSON.stringify({ account_id: accountId, targets, messages, media_path: mediaPath, delay, personalize }) });
   const data = await r.json();
   if (data.success) {
     campaignTaskId = data.task_id;
