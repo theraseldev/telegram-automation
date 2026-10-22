@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Panel — MR ADS TG Automation</title>
+<style>
+/* ── Admin uses the same design tokens as the dashboard (v3) ────────────── */
+:root{
+  --bg:#070b14;--surface:rgba(20,28,45,.72);--surface-2:rgba(28,38,60,.55);
+  --border:rgba(120,150,200,.14);--border-strong:rgba(120,150,200,.3);
+  --text:#e8eefc;--muted:#8fa0bf;--muted-2:#6c7d9c;
+  --accent:#22d3ee;--accent-2:#7c5cff;--accent-3:#38ef9b;--danger:#ff6b81;--warn:#ffb648;
+  --radius:14px;--shadow:0 18px 40px -18px rgba(0,0,0,.85);--shadow-soft:0 8px 24px -14px rgba(0,0,0,.8);
+  --font:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:var(--font);color:var(--text);min-height:100vh;font-size:14px;
+  background:
+    radial-gradient(1000px 520px at 10% -10%,rgba(124,92,255,.18),transparent 60%),
+    radial-gradient(820px 460px at 105% 0%,rgba(34,211,238,.13),transparent 55%),
+    var(--bg);
+  background-attachment:fixed;
+}
+.top-bar{
+  position:sticky;top:0;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:14px;
+  padding:14px 24px;background:rgba(9,14,26,.9);border-bottom:1px solid var(--border);backdrop-filter:blur(14px);
+}
+.top-bar h1{
+  font-size:17px;font-weight:750;letter-spacing:-.2px;
+  background:linear-gradient(100deg,var(--accent),var(--accent-2));
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.top-bar .links{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.top-bar a{color:var(--muted);text-decoration:none;font-size:12.5px;transition:color .18s ease}
+.top-bar a:hover{color:var(--accent)}
+.container{max-width:1420px;margin:0 auto;padding:26px 24px 60px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:24px}
+.stat-box{
+  position:relative;overflow:hidden;padding:17px 15px;text-align:center;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-soft);
+}
+.stat-box::after{content:'';position:absolute;inset:0 0 auto;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.65}
+.stat-box .num{font-size:27px;font-weight:750;color:var(--accent)}
+.stat-box .lbl{font-size:11px;color:var(--muted);margin-top:5px;text-transform:uppercase;letter-spacing:.7px}
+.plan-badge{display:inline-flex;padding:3px 9px;border-radius:999px;font-size:10.5px;font-weight:700;border:1px solid transparent}
+.badge-free{background:rgba(143,160,191,.14);color:var(--muted);border-color:var(--border)}
+.badge-basic{background:rgba(56,239,155,.14);color:#5df2ae;border-color:rgba(56,239,155,.28)}
+.badge-pro{background:rgba(34,211,238,.14);color:#7fe6fb;border-color:rgba(34,211,238,.28)}
+.badge-unlimited{background:rgba(255,182,72,.14);color:#ffc978;border-color:rgba(255,182,72,.28)}
+.badge-expired{background:rgba(255,107,129,.14);color:#ff9aab;border-color:rgba(255,107,129,.28)}
+.badge-banned{background:rgba(255,107,129,.16);color:#ffb3c0;border-color:rgba(255,107,129,.3)}
+.tabs{display:flex;gap:4px;margin-bottom:20px;padding:4px;border-radius:12px;background:rgba(143,160,191,.08);border:1px solid var(--border);overflow-x:auto}
+.tab{
+  padding:10px 18px;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--muted);
+  border-radius:9px;white-space:nowrap;transition:all .18s ease;user-select:none;
+}
+.tab:hover{color:var(--text)}
+.tab.active{background:linear-gradient(100deg,var(--accent),#3b9dff);color:#04121c}
+.tab-content{display:none}
+.tab-content.active{display:block;animation:fadeIn .3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-soft)}
+.card h3{font-size:14.5px;font-weight:650;margin-bottom:15px;padding-bottom:11px;border-bottom:1px solid var(--border)}
+.form-row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-group label{font-size:11.5px;color:var(--muted);font-weight:500}
+input,select,textarea{
+  background:rgba(6,10,20,.85);border:1px solid var(--border);border-radius:10px;color:var(--text);
+  padding:9px 12px;font-size:13px;outline:none;font-family:inherit;transition:border-color .18s ease,box-shadow .18s ease;
+}
+input:focus,select:focus,textarea:focus{border-color:rgba(34,211,238,.6);box-shadow:0 0 0 3px rgba(34,211,238,.14)}
+select option{background:#0b1220}
+.btn{
+  display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:10px;border:1px solid transparent;
+  cursor:pointer;font-size:12.5px;font-weight:650;font-family:inherit;
+  transition:transform .16s ease,background .16s ease,box-shadow .16s ease,opacity .16s ease;
+}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn-primary{background:linear-gradient(100deg,var(--accent),#3b9dff);color:#04121c}
+.btn-primary:hover{box-shadow:0 12px 26px -14px rgba(34,211,238,.95)}
+.btn-danger{background:rgba(255,107,129,.12);border-color:rgba(255,107,129,.35);color:var(--danger)}
+.btn-danger:hover{background:rgba(255,107,129,.22)}
+.btn-gray{background:rgba(143,160,191,.1);border-color:var(--border);color:var(--text)}
+.btn-gray:hover{background:rgba(143,160,191,.2)}
+.btn-warn{background:rgba(255,182,72,.12);border-color:rgba(255,182,72,.35);color:var(--warn)}
+.btn-warn:hover{background:rgba(255,182,72,.22)}
+.btn-sm{padding:6px 11px;font-size:11.5px;border-radius:8px}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{
+  text-align:left;padding:11px 12px;color:var(--muted);font-weight:600;font-size:10.5px;
+  text-transform:uppercase;letter-spacing:.7px;background:rgba(6,10,20,.7);
+  border-bottom:1px solid var(--border);white-space:nowrap;
+}
+td{padding:11px 12px;border-bottom:1px solid rgba(120,150,200,.08);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(34,211,238,.045)}
+.key-display{background:rgba(6,10,20,.7);border:1px solid var(--border);border-radius:10px;padding:11px;max-height:220px;overflow-y:auto;margin-top:10px}
+.key-item{
+  font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:6px 9px;border-radius:8px;
+  background:var(--surface-2);margin-bottom:5px;display:flex;align-items:center;justify-content:space-between;
+  cursor:pointer;user-select:all;transition:background .16s ease;
+}
+.key-item:hover{background:rgba(34,211,238,.1)}
+.alert{display:none;padding:12px 15px;border-radius:11px;font-size:13px;margin-bottom:14px;border:1px solid transparent}
+.alert.show{display:block;animation:fadeIn .25s ease}
+.alert-success{background:rgba(56,239,155,.1);border-color:rgba(56,239,155,.32);color:#7df7bd}
+.alert-error{background:rgba(255,107,129,.1);border-color:rgba(255,107,129,.34);color:#ffb3c0}
+.alert-info{background:rgba(34,211,238,.1);border-color:rgba(34,211,238,.3);color:#8ce9fb}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(232,238,252,.2);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.muted{color:var(--muted-2)}
+@media(max-width:640px){
+  .container{padding:18px 13px 44px}
+  .top-bar{padding:12px 14px;flex-direction:column;align-items:flex-start}
+  .stat-box .num{font-size:23px}
+}
+</style>
+</head>
+<body>
+<div class="top-bar">
+  <h1>🛡 MR ADS TG — Admin Panel</h1>
+  <div class="links">
+    <span class="muted" style="font-size:12px">Signed in as <strong style="color:var(--accent)">{{ user.username }}</strong></span>
+    <a href="/dashboard">← Dashboard</a>
+    <a href="/logout">Logout</a>
+  </div>
+</div>
+
+<div class="container">
+  <div class="stats-grid" id="adminStats">
+    <div class="stat-box"><div class="num" id="sTotalUsers">–</div><div class="lbl">Total Users</div></div>
+    <div class="stat-box"><div class="num" id="sTotalAccounts">–</div><div class="lbl">TG Accounts</div></div>
+    <div class="stat-box"><div class="num" id="sTotalKeys">–</div><div class="lbl">License Keys</div></div>
+    <div class="stat-box"><div class="num" id="sUsedKeys">–</div><div class="lbl">Used Keys</div></div>
+    <div class="stat-box"><div class="num" id="sFreeUsers">–</div><div class="lbl">Free</div></div>
+    <div class="stat-box"><div class="num" style="color:#5df2ae" id="sBasicUsers">–</div><div class="lbl">Basic</div></div>
+    <div class="stat-box"><div class="num" style="color:#7fe6fb" id="sProUsers">–</div><div class="lbl">Pro</div></div>
+    <div class="stat-box"><div class="num" style="color:#ffc978" id="sUnlimitedUsers">–</div><div class="lbl">Unlimited</div></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('users', event)">👥 Users</div>
+    <div class="tab" onclick="showTab('keygen', event)">🔑 Key Generator</div>
+    <div class="tab" onclick="showTab('keys', event)">📋 All Keys</div>
+  </div>
+
+  <!-- USERS TAB -->
+  <div class="tab-content active" id="tab-users">
+    <div class="alert" id="userAlert"></div>
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0;border:none;padding:0">All Users</h3>
+        <button class="btn btn-gray btn-sm" onclick="loadUsers()">🔄 Refresh</button>
+      </div>
+      <div class="table-wrap" style="margin-top:14px">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Username</th><th>Registered</th><th>Last login</th><th>Plan</th>
+              <th>Expires</th><th>TG Accounts</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="usersTable">
+            <tr><td colspan="9" style="text-align:center;padding:22px" class="muted"><span class="spinner"></span> Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" id="setPlanCard" style="display:none;border-color:rgba(34,211,238,.35)">
+      <h3>✏️ Set plan for <span id="setPlanUsername" style="color:var(--accent)"></span></h3>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Plan</label>
+          <select id="setPlanSelect">
+            <option value="free">Free</option>
+            <option value="basic">Basic</option>
+            <option value="pro">Pro</option>
+            <option value="unlimited">Unlimited</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Duration (days, 0 = forever)</label>
+          <input type="number" id="setPlanDays" value="30" min="0" style="width:150px">
+        </div>
+        <button class="btn btn-primary" onclick="confirmSetPlan()">✅ Apply</button>
+        <button class="btn btn-gray" onclick="document.getElementById('setPlanCard').style.display='none'">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- KEY GENERATOR TAB -->
+  <div class="tab-content" id="tab-keygen">
+    <div class="alert" id="keygenAlert"></div>
+    <div class="card">
+      <h3>🔑 Generate license keys</h3>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Plan</label>
+          <select id="kgPlan">
+            <option value="basic">Basic</option>
+            <option value="pro">Pro</option>
+            <option value="unlimited">Unlimited</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Duration (days)</label>
+          <input type="number" id="kgDays" value="30" min="1" style="width:110px">
+        </div>
+        <div class="form-group">
+          <label>Quantity</label>
+          <input type="number" id="kgCount" value="1" min="1" max="100" style="width:90px">
+        </div>
+        <div class="form-group">
+          <label>Max uses / key</label>
+          <input type="number" id="kgMaxUses" value="1" min="1" style="width:110px">
+        </div>
+        <div class="form-group">
+          <label>Notes (optional)</label>
+          <input type="text" id="kgNotes" placeholder="e.g. Promo batch" style="width:190px">
+        </div>
+        <button class="btn btn-primary" onclick="generateKeys()">⚡ Generate</button>
+      </div>
+      <div id="generatedKeys" style="display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+          <span class="muted" style="font-size:12.5px">Generated keys — click one to copy:</span>
+          <button class="btn btn-gray btn-sm" onclick="copyAllKeys()">📋 Copy all</button>
+        </div>
+        <div class="key-display" id="keyList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ALL KEYS TAB -->
+  <div class="tab-content" id="tab-keys">
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0;border:none;padding:0">All license keys</h3>
+        <button class="btn btn-gray btn-sm" onclick="loadKeys()">🔄 Refresh</button>
+      </div>
+      <div class="table-wrap" style="margin-top:14px">
+        <table>
+          <thead>
+            <tr><th>Key</th><th>Plan</th><th>Duration</th><th>Uses</th><th>Used by</th><th>Created</th><th>Status</th><th>Action</th></tr>
+          </thead>
+          <tbody id="keysTable">
+            <tr><td colspan="8" style="text-align:center;padding:22px" class="muted"><span class="spinner"></span> Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: these endpoints are the ones the Flask app actually serves.
+// The previous version called /api/admin/* which does not exist, so every
+// button and table on this page failed with 404.
+// ─────────────────────────────────────────────────────────────────────────────
+const ADMIN_API = '/bot/admin';
+let selectedUserId = null;
+
+function showTab(name, ev) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (ev && ev.currentTarget) ev.currentTarget.classList.add('active');
+  if (name === 'users') loadUsers();
+  else if (name === 'keys') loadKeys();
+}
+
+function showAlert(id, msg, type) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'alert alert-' + type + ' show';
+  el.textContent = msg;
+  if (type !== 'error') setTimeout(() => el.classList.remove('show'), 5000);
+}
+
+function planBadge(plan, expired) {
+  if (expired) return '<span class="plan-badge badge-expired">Expired</span>';
+  return '<span class="plan-badge badge-' + plan + '">' + plan.charAt(0).toUpperCase() + plan.slice(1) + '</span>';
+}
+
+function escapeHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function adminFetch(path, options) {
+  try {
+    const r = await fetch(ADMIN_API + path, Object.assign({
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    }, options || {}));
+    const text = await r.text();
+    if (!text || !text.trim()) return { success: false, error: 'Empty response (HTTP ' + r.status + ')' };
+    try { return JSON.parse(text); } catch (e) { return { success: false, error: 'Invalid response (HTTP ' + r.status + ')' }; }
+  } catch (e) {
+    return { success: false, error: 'Network error: ' + e.message };
+  }
+}
+
+async function loadStats() {
+  const d = await adminFetch('/stats');
+  if (!d.success) return;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('sTotalUsers', d.total_users ?? 0);
+  set('sTotalAccounts', d.total_accounts ?? 0);
+  set('sTotalKeys', d.total_keys ?? 0);
+  set('sUsedKeys', d.used_keys ?? 0);
+  const pc = d.plan_counts || {};
+  set('sFreeUsers', pc.free || 0);
+  set('sBasicUsers', pc.basic || 0);
+  set('sProUsers', pc.pro || 0);
+  set('sUnlimitedUsers', pc.unlimited || 0);
+}
+
+async function loadUsers() {
+  const tbody = document.getElementById('usersTable');
+  tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:22px" class="muted"><span class="spinner"></span> Loading…</td></tr>';
+  const d = await adminFetch('/users');
+  if (!d.success) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:22px;color:#ff9aab">' + escapeHtml(d.error || 'Could not load users') + '</td></tr>';
+    return;
+  }
+  if (!d.users || !d.users.length) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:22px" class="muted">No users yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.users.map(u => `
+    <tr>
+      <td class="muted">#${u.id}</td>
+      <td><strong>${escapeHtml(u.username)}</strong></td>
+      <td class="muted">${escapeHtml(u.created_at)}</td>
+      <td class="muted">${escapeHtml(u.last_login_at || 'never')}</td>
+      <td>${planBadge(u.plan, u.expired)}</td>
+      <td class="muted">${escapeHtml(u.expires_at)}</td>
+      <td style="color:var(--accent)">${u.accounts}</td>
+      <td>${u.is_banned ? '<span class="plan-badge badge-banned">Banned</span>' : '<span class="plan-badge badge-basic">Active</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-gray btn-sm" onclick="openSetPlan(${u.id},'${escapeHtml(u.username)}','${u.plan}')">✏️ Plan</button>
+        <button class="btn ${u.is_banned ? 'btn-warn' : 'btn-gray'} btn-sm" style="margin-left:4px" onclick="adminToggleBan(${u.id}, ${u.is_banned ? 'false' : 'true'})">${u.is_banned ? '♻️ Unban' : '🚫 Ban'}</button>
+        <button class="btn btn-danger btn-sm" style="margin-left:4px" onclick="deleteUser(${u.id},'${escapeHtml(u.username)}')">🗑</button>
+      </td>
+    </tr>`).join('');
+}
+
+function openSetPlan(userId, username, currentPlan) {
+  selectedUserId = userId;
+  document.getElementById('setPlanUsername').textContent = username;
+  document.getElementById('setPlanSelect').value = currentPlan;
+  const card = document.getElementById('setPlanCard');
+  card.style.display = 'block';
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function confirmSetPlan() {
+  if (!selectedUserId) return;
+  const plan = document.getElementById('setPlanSelect').value;
+  const days = parseInt(document.getElementById('setPlanDays').value) || 0;
+  const d = await adminFetch('/set_plan', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: selectedUserId, plan, days })
+  });
+  showAlert('userAlert', d.success ? ('✅ ' + d.message) : ('❌ ' + (d.error || 'Failed')), d.success ? 'success' : 'error');
+  if (d.success) { document.getElementById('setPlanCard').style.display = 'none'; loadUsers(); loadStats(); }
+}
+
+async function adminToggleBan(userId, ban) {
+  const d = await adminFetch('/ban_user', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, ban })
+  });
+  showAlert('userAlert', d.success ? ('✅ ' + (d.message || 'Updated')) : ('❌ ' + (d.error || 'Failed')), d.success ? 'success' : 'error');
+  if (d.success) loadUsers();
+}
+
+async function deleteUser(userId, username) {
+  if (!confirm('Delete user "' + username + '"? This removes ALL their accounts and data. This cannot be undone.')) return;
+  const d = await adminFetch('/delete_user/' + userId, { method: 'DELETE' });
+  showAlert('userAlert', d.success ? '✅ User deleted' : ('❌ ' + (d.error || 'Failed')), d.success ? 'success' : 'error');
+  if (d.success) { loadUsers(); loadStats(); }
+}
+
+async function generateKeys() {
+  const plan = document.getElementById('kgPlan').value;
+  const days = parseInt(document.getElementById('kgDays').value) || 30;
+  const count = parseInt(document.getElementById('kgCount').value) || 1;
+  const max_uses = parseInt(document.getElementById('kgMaxUses').value) || 1;
+  const notes = document.getElementById('kgNotes').value.trim();
+  const btn = event && event.target ? event.target : null;
+  if (btn) btn.disabled = true;
+  const d = await adminFetch('/generate_keys', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plan, days, count, max_uses, notes })
+  });
+  if (btn) btn.disabled = false;
+  if (!d.success) { showAlert('keygenAlert', '❌ ' + (d.error || 'Failed'), 'error'); return; }
+  const box = document.getElementById('generatedKeys');
+  const list = document.getElementById('keyList');
+  box.style.display = 'block';
+  list.innerHTML = d.keys.map(k => '<div class="key-item" onclick="copyKey(this)">' + escapeHtml(k) + ' <span class="muted" style="font-size:11px">📋</span></div>').join('');
+  showAlert('keygenAlert', '✅ Generated ' + d.count + ' key(s) for the ' + plan + ' plan (' + days + ' days)', 'success');
+  loadStats();
+}
+
+function copyKey(el) {
+  const key = el.textContent.replace('📋', '').trim();
+  navigator.clipboard.writeText(key).then(() => {
+    el.style.background = 'rgba(56,239,155,.18)';
+    setTimeout(() => { el.style.background = ''; }, 900);
+  });
+}
+
+function copyAllKeys() {
+  const keys = [...document.querySelectorAll('.key-item')].map(el => el.textContent.replace('📋', '').trim()).join('\n');
+  navigator.clipboard.writeText(keys).then(() => showAlert('keygenAlert', '✅ All keys copied to the clipboard.', 'success'));
+}
+
+async function loadKeys() {
+  const tbody = document.getElementById('keysTable');
+  tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:22px" class="muted"><span class="spinner"></span> Loading…</td></tr>';
+  const d = await adminFetch('/keys');
+  if (!d.success) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:22px;color:#ff9aab">' + escapeHtml(d.error || 'Could not load keys') + '</td></tr>';
+    return;
+  }
+  if (!d.keys || !d.keys.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:22px" class="muted">No keys generated yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.keys.map(k => `
+    <tr>
+      <td><span style="font-family:ui-monospace,monospace;font-size:12px;cursor:pointer" onclick="navigator.clipboard.writeText('${escapeHtml(k.key)}')" title="Click to copy">${escapeHtml(k.key)}</span></td>
+      <td>${planBadge(k.plan, false)}</td>
+      <td class="muted">${k.duration_days}d</td>
+      <td class="muted">${k.use_count}/${k.max_uses}</td>
+      <td class="muted">${escapeHtml(k.used_by || '–')}${k.used_at ? ' (' + escapeHtml(k.used_at) + ')' : ''}</td>
+      <td class="muted">${escapeHtml(k.created_at)}</td>
+      <td>${k.is_active ? '<span style="color:#5df2ae;font-size:12px">✅ Active</span>' : '<span style="color:#ff9aab;font-size:12px">❌ Inactive</span>'}</td>
+      <td><button class="btn btn-gray btn-sm" onclick="toggleKey(${k.id}, this)">${k.is_active ? 'Revoke' : 'Restore'}</button></td>
+    </tr>`).join('');
+}
+
+async function toggleKey(keyId, btn) {
+  btn.disabled = true;
+  const d = await adminFetch('/revoke_key/' + keyId, { method: 'POST' });
+  if (d.success) loadKeys();
+  else showAlert('keygenAlert', '❌ ' + (d.error || 'Failed'), 'error');
+  btn.disabled = false;
+}
+
+loadStats();
+loadUsers();
+</script>
+</body>
+</html>

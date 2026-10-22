@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MR ADS TG Automation — Login</title>
+    <style>
+        /* ── Design tokens shared with the dashboard (v3) ───────────────── */
+        :root{
+            --bg:#070b14;--surface:rgba(20,28,45,.72);--border:rgba(120,150,200,.16);
+            --text:#e8eefc;--muted:#8fa0bf;--muted-2:#6c7d9c;
+            --accent:#22d3ee;--accent-2:#7c5cff;--accent-3:#38ef9b;--danger:#ff6b81;
+            --radius:18px;--shadow:0 30px 60px -30px rgba(0,0,0,.9);
+            --font:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{
+            font-family:var(--font);color:var(--text);min-height:100vh;
+            display:flex;align-items:center;justify-content:center;padding:22px;
+            background:
+                radial-gradient(900px 520px at 15% -10%,rgba(124,92,255,.22),transparent 60%),
+                radial-gradient(760px 480px at 110% 10%,rgba(34,211,238,.18),transparent 55%),
+                var(--bg);
+        }
+        .container{
+            width:100%;max-width:430px;padding:38px 34px 32px;
+            background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+            box-shadow:var(--shadow);backdrop-filter:blur(16px);
+            animation:rise .5s cubic-bezier(.22,.9,.3,1);
+        }
+        @keyframes rise{from{opacity:0;transform:translateY(16px) scale(.99)}to{opacity:1;transform:none}}
+        .logo{text-align:center;margin-bottom:26px}
+        .logo .mark{
+            width:56px;height:56px;margin:0 auto 14px;border-radius:16px;
+            display:flex;align-items:center;justify-content:center;font-size:26px;
+            background:linear-gradient(135deg,rgba(34,211,238,.25),rgba(124,92,255,.3));
+            border:1px solid rgba(34,211,238,.3);box-shadow:0 14px 30px -18px rgba(34,211,238,.9);
+        }
+        .logo h1{
+            font-size:23px;font-weight:750;letter-spacing:-.3px;
+            background:linear-gradient(100deg,var(--accent),var(--accent-2));
+            -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+        }
+        .logo p{color:var(--muted-2);font-size:12.5px;margin-top:7px}
+        .logo p a{color:var(--accent);text-decoration:none}
+        .tabs{display:flex;gap:4px;margin-bottom:22px;padding:4px;border-radius:12px;background:rgba(143,160,191,.09);border:1px solid var(--border)}
+        .tab{flex:1;padding:10px;text-align:center;cursor:pointer;border-radius:9px;color:var(--muted);font-size:13px;font-weight:600;transition:all .2s ease;user-select:none}
+        .tab:hover{color:var(--text)}
+        .tab.active{background:linear-gradient(100deg,var(--accent),#3b9dff);color:#04121c}
+        .form-group{margin-bottom:16px}
+        label{display:block;color:var(--muted);font-size:12.5px;margin-bottom:7px;font-weight:500}
+        input{
+            width:100%;padding:13px 15px;color:var(--text);font-size:14.5px;font-family:inherit;
+            background:rgba(6,10,20,.85);border:1px solid var(--border);border-radius:11px;
+            transition:border-color .2s ease,box-shadow .2s ease;
+        }
+        input::placeholder{color:var(--muted-2)}
+        input:focus{outline:none;border-color:rgba(34,211,238,.6);box-shadow:0 0 0 3px rgba(34,211,238,.15)}
+        .btn{
+            width:100%;padding:13px;margin-top:6px;cursor:pointer;font-size:14.5px;font-weight:700;font-family:inherit;
+            color:#04121c;border:none;border-radius:11px;
+            background:linear-gradient(100deg,var(--accent),#3b9dff);
+            transition:transform .18s ease,box-shadow .18s ease,opacity .18s ease;
+        }
+        .btn:hover{transform:translateY(-1px);box-shadow:0 16px 32px -16px rgba(34,211,238,.95)}
+        .btn:disabled{opacity:.6;cursor:default;transform:none}
+        .msg{padding:12px 15px;border-radius:11px;margin-bottom:16px;font-size:13px;line-height:1.5;border:1px solid transparent}
+        .msg.error{background:rgba(255,107,129,.11);border-color:rgba(255,107,129,.35);color:#ffb3c0}
+        .msg.success-msg{background:rgba(56,239,155,.1);border-color:rgba(56,239,155,.32);color:#7df7bd;display:none}
+        .msg.info{background:rgba(34,211,238,.1);border-color:rgba(34,211,238,.3);color:#8ce9fb}
+        .foot{margin-top:22px;text-align:center;font-size:11.5px;color:var(--muted-2);line-height:1.7}
+        .foot a{color:var(--accent);text-decoration:none}
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="logo">
+        <div class="mark">⚡</div>
+        <h1>MR ADS TG Automation</h1>
+        <p>Telegram automation dashboard by <a href="https://t.me/trustedzone139" target="_blank" rel="noopener">MR ADS</a></p>
+    </div>
+
+    {% if registration_enabled %}
+    <div class="tabs">
+        <div class="tab active" id="loginTab" onclick="switchTab('login')">Login</div>
+        <div class="tab" id="registerTab" onclick="switchTab('register')">Register</div>
+    </div>
+    {% endif %}
+
+    {% if error %}
+    <div class="msg error">{{ error }}</div>
+    {% endif %}
+    <div class="msg success-msg" id="successMsg"></div>
+
+    <div id="loginForm">
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="loginUsername">Username</label>
+                <input type="text" id="loginUsername" name="username" placeholder="Enter username" autocomplete="username" required>
+            </div>
+            <div class="form-group">
+                <label for="loginPassword">Password</label>
+                <input type="password" id="loginPassword" name="password" placeholder="Enter password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn" id="loginBtn">Sign in</button>
+        </form>
+    </div>
+
+    {% if registration_enabled %}
+    <div id="registerForm" style="display:none">
+        <div class="form-group">
+            <label for="regUsername">Username</label>
+            <input type="text" id="regUsername" placeholder="Choose username (3+ characters)" autocomplete="username">
+        </div>
+        <div class="form-group">
+            <label for="regPassword">Password</label>
+            <input type="password" id="regPassword" placeholder="Choose password (6+ characters)" autocomplete="new-password">
+        </div>
+        <button class="btn" onclick="register()" id="registerBtn">Create account</button>
+    </div>
+    {% endif %}
+
+    <div class="foot">
+        Sessions stay signed in for 365 days.<br>
+        Telegram sessions are stored in your database — an admin can revoke them from the Accounts page.
+    </div>
+</div>
+<script>
+function showMsg(text, cls) {
+    const el = document.getElementById('successMsg');
+    if (!el) return;
+    el.className = 'msg ' + (cls || 'info');
+    el.textContent = text;
+    el.style.display = 'block';
+    if (cls !== 'error') setTimeout(() => { el.style.display = 'none'; }, 6000);
+}
+function switchTab(tab) {
+    const loginForm = document.getElementById('loginForm');
+    const registerForm = document.getElementById('registerForm');
+    const loginTab = document.getElementById('loginTab');
+    const registerTab = document.getElementById('registerTab');
+    if (!loginForm || !registerForm) return;
+    loginTab.classList.toggle('active', tab === 'login');
+    registerTab.classList.toggle('active', tab === 'register');
+    loginForm.style.display = tab === 'login' ? 'block' : 'none';
+    registerForm.style.display = tab === 'register' ? 'block' : 'none';
+}
+async function register() {
+    const username = document.getElementById('regUsername').value.trim();
+    const password = document.getElementById('regPassword').value.trim();
+    if (!username || !password) { showMsg('Please fill in both fields.', 'error'); return; }
+    const btn = document.getElementById('registerBtn');
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    const fd = new FormData();
+    fd.append('username', username);
+    fd.append('password', password);
+    try {
+        const r = await fetch('/register', { method: 'POST', body: fd });
+        let data = null;
+        try { data = await r.json(); } catch (e) { data = null; }
+        if (data && data.success) {
+            showMsg('Account created. You can sign in now.', 'success-msg');
+            switchTab('login');
+            document.getElementById('loginUsername').value = username;
+        } else {
+            showMsg((data && data.error) || ('Registration failed (HTTP ' + r.status + ')'), 'error');
+        }
+    } catch (e) {
+        showMsg('Network error: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create account';
+    }
+}
+// Prevent double submits (a common cause of duplicate jobs/requests)
+document.addEventListener('DOMContentLoaded', () => {
+    const form = document.querySelector('#loginForm form');
+    if (form) form.addEventListener('submit', () => {
+        const btn = document.getElementById('loginBtn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+    });
+});
+</script>
+</body>
+</html>
