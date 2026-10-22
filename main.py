@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response
+from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -791,6 +791,7 @@ class ChannelScheduledPost(db.Model):
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
     sent_at         = db.Column(db.DateTime, nullable=True)
     repeat_interval = db.Column(db.Integer, default=0)   # hours, 0 = no repeat
+    media_path      = db.Column(db.Text, nullable=True)  # device-uploaded photo/video
 
 
 class AutoVideoPostCampaign(db.Model):
@@ -7098,6 +7099,37 @@ except OSError as exc:                       # pragma: no cover - environment de
     logger.warning('Could not create media root %s: %s', AUTO_VIDEO_ROOT, exc)
 ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v'}
 
+# ─── DEVICE UPLOADS FOR THE MESSAGING TOOLS ──────────────────────────────────
+# Photos/videos picked straight from the operator's device are stored here and
+# the absolute path is handed back to the existing senders (they already accept
+# local paths), so no sender had to change. Same candidate order as the
+# auto-poster: explicit env dir > /data volume > app directory.
+ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+ALLOWED_MEDIA_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS
+
+
+def _resolve_messaging_media_root():
+    candidates = []
+    configured = (os.environ.get('MESSAGING_MEDIA_DIR') or '').strip()
+    if configured:
+        candidates.append(configured)
+    candidates.append(os.path.join(os.sep, 'data', 'messaging_media'))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'messaging_media'))
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, '.write_probe')
+            with open(probe, 'w', encoding='utf-8') as fh:
+                fh.write('ok')
+            os.remove(probe)
+            return candidate
+        except Exception:
+            continue
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'messaging_media')
+
+
+MESSAGING_MEDIA_ROOT = _resolve_messaging_media_root()
+
 # campaign_id -> Thread for every round this process is currently running.
 # Guarantees that a campaign can never be posted by two threads at once.
 _AVP_ACTIVE = {}
@@ -8169,6 +8201,75 @@ def run_auto_video_post_scheduler():
 # ─── SAVED TARGETS + APP CONFIG + DATABASE HEALTH ─────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@app.route('/bot/upload_media', methods=['POST'])
+@login_required
+def upload_media():
+    """Accept a photo or video straight from the operator's device.
+
+    The dashboard posts one or more files here, gets back the stored absolute
+    path and drops it into the existing "media URL/path" field, so Broadcast,
+    Scheduled Broadcast, Group Message and Channel Post can all send it without
+    the operator needing a public URL.
+    """
+    files = request.files.getlist('file') or request.files.getlist('files')
+    files = [f for f in files if f and clean_str(f.filename)]
+    if not files:
+        return jsonify({'success': False, 'error': 'No file received'}), 400
+
+    saved = []
+    for stored in files:
+        original = clean_str(stored.filename)
+        ext = os.path.splitext(original)[1].lower()
+        if ext not in ALLOWED_MEDIA_EXTENSIONS:
+            return jsonify({
+                'success': False,
+                'error': (f"'{original}' is not a supported media type. "
+                          "Photos: jpg, jpeg, png, webp, gif. Videos: mp4, mov, mkv, webm, avi, m4v."),
+            }), 400
+        safe = secure_filename(original) or 'upload'
+        name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe}"
+        target = os.path.join(MESSAGING_MEDIA_ROOT, name)
+        try:
+            stored.save(target)
+        except Exception as e:
+            logger.error('Media upload failed: %s', e)
+            return jsonify({'success': False, 'error': f'Could not store {original}: {e}'}), 500
+        size = os.path.getsize(target) if os.path.exists(target) else 0
+        if size == 0:
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            return jsonify({'success': False, 'error': f"'{original}' is empty"}), 400
+        saved.append({
+            'name': name,
+            'original_name': original,
+            'path': target,
+            'url': url_for('messaging_media', filename=name),
+            'kind': 'photo' if ext in ALLOWED_IMAGE_EXTENSIONS else 'video',
+            'size': size,
+            'persistent': MESSAGING_MEDIA_ROOT.startswith(os.path.join(os.sep, 'data') + os.sep)
+                          or bool(os.environ.get('MESSAGING_MEDIA_DIR')),
+        })
+
+    first = saved[0]
+    log_activity(current_user.id,
+                 f"Uploaded {first['kind']} from device: {first['original_name']} "
+                 f"({round(first['size'] / 1048576, 2)} MB)",
+                 'success')
+    return jsonify({'success': True, 'file': first, 'files': saved})
+
+
+@app.route('/media/<path:filename>')
+@login_required
+def messaging_media(filename):
+    """Serve an uploaded photo/video back to the dashboard so it can preview it."""
+    try:
+        return send_from_directory(MESSAGING_MEDIA_ROOT, filename)
+    except Exception:
+        return jsonify({'success': False, 'error': 'File not found'}), 404
+
+
 @app.route('/bot/app_config')
 @login_required
 def app_config():
@@ -8289,9 +8390,10 @@ def channel_post_create():
     channel         = data.get('channel', '').strip()
     content         = data.get('content', '').strip()
     message_type    = data.get('message_type', 'text')
+    media_path      = clean_str(data.get('media_path'))
     dt_local        = data.get('scheduled_at', '')
     repeat_interval = safe_int(data.get('repeat_interval'), 0)
-    if not channel or not content or not dt_local:
+    if not channel or not (content or media_path) or not dt_local:
         return jsonify({'success': False, 'error': 'Fill all fields'})
     acc = get_account_for_current_user(account_id)
     if not acc:
@@ -8303,7 +8405,8 @@ def channel_post_create():
     post = ChannelScheduledPost(user_id=current_user.id, account_id=account_id,
                                 channel=channel, content=content,
                                 message_type=message_type, scheduled_at=scheduled_at,
-                                repeat_interval=repeat_interval)
+                                repeat_interval=repeat_interval,
+                                media_path=media_path or None)
     db.session.add(post)
     db.session.commit()
     return jsonify({'success': True, 'message': f'Post scheduled for {scheduled_at.strftime("%Y-%m-%d %H:%M")}'})
@@ -8356,18 +8459,26 @@ def run_channel_post_scheduler():
                         channel = post.channel
                         content = post.content
                         mtype   = post.message_type
+                        media   = post.media_path
                         sess    = acc.session_string
                         repeat  = post.repeat_interval
                         user_id = post.user_id
                         account_id = post.account_id
 
                         async def _send(sess=sess, api_id=api_id, api_hash=api_hash, proxy=proxy,
-                                        channel=channel, content=content, mtype=mtype):
+                                        channel=channel, content=content, mtype=mtype, media=media):
                             client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                             await client.connect()
                             try:
                                 entity = await client.get_entity(channel)
-                                if mtype == 'text':
+                                if media:
+                                    # Device-uploaded photo/video: the text becomes the caption.
+                                    if not os.path.exists(media):
+                                        raise FileNotFoundError(
+                                            'Uploaded media is no longer on the server '
+                                            '(ephemeral disk). Re-upload it for this post.')
+                                    await client.send_file(entity, media, caption=content or None)
+                                elif mtype == 'text' or not content:
                                     await client.send_message(entity, content)
                                 else:
                                     await client.send_file(entity, content)
@@ -9627,6 +9738,7 @@ def run_generic_scheduler():
 # Columns that may be missing on databases created by an older version.
 # Format: (table, column, sqlite_type, postgres_type)
 SCHEMA_COLUMNS = [
+    ("channel_scheduled_post", "media_path", "TEXT", "TEXT"),
     ("account_health", "tg_name", "VARCHAR(200)", "VARCHAR(200)"),
     ("account_health", "tg_username", "VARCHAR(100)", "VARCHAR(100)"),
     ("account_health", "spambot_released", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
