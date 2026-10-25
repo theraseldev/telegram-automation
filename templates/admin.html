@@ -151,6 +151,40 @@ tr:hover td{background:rgba(34,211,238,.045)}
   <!-- USERS TAB -->
   <div class="tab-content active" id="tab-users">
     <div class="alert" id="userAlert"></div>
+
+    <div class="card">
+      <h3>➕ Create user</h3>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="newUsername" placeholder="e.g. rahim" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="text" id="newPassword" placeholder="min 6 characters" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>Plan</label>
+          <select id="newPlan">
+            <option value="free">Free</option>
+            <option value="basic">Basic</option>
+            <option value="pro">Pro</option>
+            <option value="unlimited">Unlimited</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Days (0 = forever)</label>
+          <input type="number" id="newPlanDays" value="30" min="0" style="width:130px">
+        </div>
+        <button class="btn btn-primary" onclick="createAdminUser()" id="createUserBtn">Create account</button>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin-top:6px">
+        The new user signs in at <code>/login</code> with these details and gets their own dashboard — their Telegram
+        accounts, campaigns and schedules are private to them. You can also leave public self-registration enabled
+        with <code>ALLOW_REGISTRATION=1</code> (default) and set it to <code>0</code> to close sign-up.
+      </div>
+    </div>
+
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
         <h3 style="margin:0;border:none;padding:0">All Users</h3>
@@ -318,6 +352,43 @@ async function loadStats() {
   set('sBasicUsers', pc.basic || 0);
   set('sProUsers', pc.pro || 0);
   set('sUnlimitedUsers', pc.unlimited || 0);
+}
+
+async function createAdminUser() {
+  const username = (document.getElementById('newUsername').value || '').trim();
+  const password = (document.getElementById('newPassword').value || '').trim();
+  const plan = document.getElementById('newPlan').value;
+  const days = parseInt(document.getElementById('newPlanDays').value || '0', 10) || 0;
+  if (!username || !password) { showAlert('userAlert', 'Username and password are required', 'error'); return; }
+  if (username.length < 3 || password.length < 6) {
+    showAlert('userAlert', 'Username must be 3+ characters and password 6+ characters', 'error');
+    return;
+  }
+  const btn = document.getElementById('createUserBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const d = await adminFetch('/create_user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    if (!d.success) { showAlert('userAlert', d.error || 'Could not create the user', 'error'); return; }
+    // Give the account the plan the admin picked (free is the server default).
+    const created = (d.user && d.user.id) ? d.user.id : null;
+    if (created && (plan !== 'free' || days > 0)) {
+      await adminFetch('/set_plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        body: JSON.stringify({ user_id: created, plan: plan, days: days })
+      });
+    }
+    showAlert('userAlert', '✅ User "' + username + '" created — they can sign in at /login now.', 'success');
+    document.getElementById('newUsername').value = '';
+    document.getElementById('newPassword').value = '';
+    loadUsers();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function loadUsers() {
