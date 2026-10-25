@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response, send_from_directory
+from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -116,7 +116,7 @@ SAVED_MESSAGES_SCAN_LIMIT = _limit_env('SAVED_MESSAGES_SCAN_LIMIT', 1000000)
 LOG_ROWS_LIMIT = _limit_env('LOG_ROWS_LIMIT', 100000)
 # A FloodWait can legitimately require a long wait; do not truncate it.
 MAX_FLOOD_WAIT_SECONDS = _limit_env('MAX_FLOOD_WAIT_SECONDS', 86400)
-ALLOW_REGISTRATION = str(os.environ.get('ALLOW_REGISTRATION', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+ALLOW_REGISTRATION = str(os.environ.get('ALLOW_REGISTRATION', '1')).strip().lower() in ('1', 'true', 'yes', 'on')
 BACKGROUND_JOBS_ENABLED = str(os.environ.get('BACKGROUND_JOBS_ENABLED', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
 STALE_TASK_MINUTES = _env_int('STALE_TASK_MINUTES', 30, 5, 1440)
 
@@ -633,14 +633,6 @@ class BroadcastTask(db.Model):
     sent_count = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     completed_at = db.Column(db.DateTime, nullable=True)
-    # ── Repeating rounds ─────────────────────────────────────────────────────
-    # These live in the database, not in the thread that started the run, so a
-    # redeploy/restart can resume a campaign that is waiting between rounds.
-    caption = db.Column(db.Text)
-    repeat = db.Column(db.Integer, default=1)        # total rounds; 0 = forever
-    rounds_done = db.Column(db.Integer, default=0)   # rounds already sent
-    next_round_at = db.Column(db.DateTime, nullable=True)  # when round N+1 is due
-    task_key = db.Column(db.String(64))
 
 
 class ScheduledBroadcast(db.Model):
@@ -791,7 +783,6 @@ class ChannelScheduledPost(db.Model):
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
     sent_at         = db.Column(db.DateTime, nullable=True)
     repeat_interval = db.Column(db.Integer, default=0)   # hours, 0 = no repeat
-    media_path      = db.Column(db.Text, nullable=True)  # device-uploaded photo/video
 
 
 class AutoVideoPostCampaign(db.Model):
@@ -807,11 +798,6 @@ class AutoVideoPostCampaign(db.Model):
     channels        = db.Column(db.Text, nullable=False)  # JSON list of channel usernames/links
     media_dir       = db.Column(db.String(500), nullable=False)
     caption         = db.Column(db.Text, nullable=True)
-    # JSON list of caption templates. ONE is chosen at random per round and used
-    # for every channel in that round (so a single video never shows two different
-    # captions across channels). The single `caption` column above stays as the
-    # fallback so existing campaigns keep working unchanged.
-    captions        = db.Column(db.Text, nullable=True)
     min_delay       = db.Column(db.Integer, default=5)
     max_delay       = db.Column(db.Integer, default=15)
     current_index   = db.Column(db.Integer, default=0)
@@ -915,7 +901,11 @@ PLAN_FEATURES = {
     'unlimited': ['all'],
 }
 
-ADMIN_USERS = {'admin'}
+# The owner account. Defaults to MRADS / MRADS so a fresh host (Railway, Render,
+# a VPS…) always has a known login; override with ADMIN_USERNAME / ADMIN_PASSWORD.
+# 'admin' stays an admin too, so an older deployment never loses its owner account.
+ADMIN_USERNAME = (os.environ.get('ADMIN_USERNAME') or 'MRADS').strip() or 'MRADS'
+ADMIN_USERS = {'admin', ADMIN_USERNAME}
 
 # Channels protected from being targeted by any tool
 PROTECTED_CHANNELS = {'trustedzoneofficials', 'trustedzone', 'trustedzone_official'}
@@ -1106,9 +1096,12 @@ def is_admin_user():
 
 
 def get_admin_user_id():
-    """Return the admin User.id (first admin in DB), or None."""
-    admin = User.query.filter_by(username='admin').first()
-    return admin.id if admin else None
+    """Return the owner account's User.id, or None."""
+    for username in (ADMIN_USERNAME, 'admin'):
+        admin = User.query.filter_by(username=username).first()
+        if admin:
+            return admin.id
+    return None
 
 
 def get_account_for_current_user(account_id):
@@ -1226,466 +1219,7 @@ def task_run_update(task_key, **fields):
 
 def task_run_finish(task_key, status='completed', **fields):
     """Mark a durable task finished (completed/partial/failed/stopped)."""
-    # A stop the operator requested always wins over the worker's own final status,
-    # otherwise a stopped run would report back as 'completed' and the UI would not
-    # show it as stopped.
-    if task_should_stop(task_key):
-        status = 'stopped'
-        task_clear_stop(task_key)
     return task_run_update(task_key, status=status, **fields)
-
-
-# ── Stop a running background task ───────────────────────────────────────────
-# Broadcast / bulk DM / campaign / forwarder runs used to be unstoppable: with a long
-# delay the operator could only watch "Sent: 1/64" for hours. The worker now checks
-# this set between sends, so Stop takes effect after the message in flight.
-TASK_CANCEL = set()
-TASK_CANCEL_LOCK = threading.Lock()
-
-
-def task_request_stop(task_key):
-    """Ask a running task to stop."""
-    with TASK_CANCEL_LOCK:
-        TASK_CANCEL.add(task_key)
-    try:
-        task_run_update(task_key, status='stopped')
-    except Exception as e:
-        logger.warning('task_request_stop(%s) could not be recorded: %s', task_key, e)
-    return True
-
-
-def task_should_stop(task_key):
-    with TASK_CANCEL_LOCK:
-        return task_key in TASK_CANCEL
-
-
-def task_clear_stop(task_key):
-    with TASK_CANCEL_LOCK:
-        TASK_CANCEL.discard(task_key)
-
-
-# ── Durable broadcast rounds ─────────────────────────────────────────────────
-# "Start Now" used to run its whole round loop inside the request thread: a full
-# round over every group, then `delay` seconds of asyncio.sleep, then the next
-# round. That only worked for as long as that one process stayed alive.
-#
-# On Railway a redeploy, a crash or a platform restart kills the thread while it
-# is sitting in the multi-hour sleep. The campaign then stays 'running' forever,
-# the progress bar is already full and round 2 never happens — which is exactly
-# the "4 hours later nothing happens" report. The delay was never the problem.
-#
-# The round loop now lives in a background scheduler that starts with the other
-# jobs at boot, and every round is booked in the DATABASE (rounds_done /
-# next_round_at). A campaign therefore survives a restart: on boot the scheduler
-# sees it is due (or overdue) and continues with the next round.
-_BROADCAST_INFLIGHT = set()
-_BROADCAST_INFLIGHT_LOCK = threading.Lock()
-_BROADCAST_WAKE = threading.Event()
-BROADCAST_TICK_SECONDS = max(5, _limit_env('BROADCAST_TICK_SECONDS', 15))
-
-
-def broadcast_task_id_from_key(task_key):
-    """'broadcast:12' -> 12 (the BroadcastTask row id), otherwise None."""
-    head, _, tail = str(task_key or '').partition(':')
-    if head != 'broadcast' or not tail:
-        return None
-    try:
-        return int(tail)
-    except (TypeError, ValueError):
-        return None
-
-
-def _broadcast_claim(task_id):
-    """True only for the caller that wins the right to run this round."""
-    with _BROADCAST_INFLIGHT_LOCK:
-        if task_id in _BROADCAST_INFLIGHT:
-            return False
-        _BROADCAST_INFLIGHT.add(task_id)
-        return True
-
-
-def _broadcast_release(task_id):
-    with _BROADCAST_INFLIGHT_LOCK:
-        _BROADCAST_INFLIGHT.discard(task_id)
-
-
-def stop_broadcast_task_for_key(task_key):
-    """Stop the durable BroadcastTask behind a 'broadcast:N' task key.
-
-    The scheduler re-books the next round from the database, so a stop that only
-    touched the in-memory TASK_CANCEL set would leave the campaign queued and it
-    would start up again on the next tick.
-    """
-    task_id = broadcast_task_id_from_key(task_key)
-    if not task_id:
-        return False
-    try:
-        with app.app_context():
-            task = BroadcastTask.query.get(task_id)
-            if not task:
-                return False
-            if (task.status or '') == 'running':
-                task.status = 'stopped'
-                task.next_round_at = None
-                task.completed_at = datetime.utcnow()
-                db.session.commit()
-            return True
-    except Exception as e:
-        logger.warning('stop_broadcast_task_for_key(%s): %s', task_key, e)
-        return False
-
-
-def broadcast_run_one_round(task_id, already_claimed=False):
-    """Send ONE round to every group of a BroadcastTask, then book the next round.
-
-    next_round_at is written BEFORE the round starts, so a process that dies
-    mid-round resumes after the interval instead of instantly re-sending a whole
-    round to everyone. Returns the round result dict, or None when nothing to do.
-    """
-    if not already_claimed and not _broadcast_claim(task_id):
-        return None
-    try:
-        with app.app_context():
-            task = BroadcastTask.query.get(task_id)
-            if not task or (task.status or '') != 'running':
-                return None
-            account = TelegramAccount.query.get(task.account_id)
-            task_key = task.task_key or f'broadcast:{task_id}'
-            if not account or not account.session_string \
-                    or account.session_string in ('demo', 'active'):
-                task.status = 'failed'
-                task.next_round_at = None
-                task.completed_at = datetime.utcnow()
-                db.session.commit()
-                task_run_finish(task_key, 'failed',
-                                errors=['Account is not connected any more'])
-                return None
-            user_id = task.user_id
-            account_id = task.account_id
-            sess = account.session_string
-            message_type = task.message_type or 'text'
-            content = task.content or ''
-            caption = task.caption
-            repeat = safe_int(task.repeat, 1, minimum=0)
-            rounds_done = safe_int(task.rounds_done, 0)
-            between_rounds = max(60, safe_int(
-                task.delay, 60, minimum=1, maximum=MAX_DELAY_SECONDS))
-            lifetime_sent = safe_int(task.sent_count, 0)
-            try:
-                group_ids = json.loads(task.groups or '[]')
-            except (TypeError, ValueError):
-                group_ids = []
-            if not group_ids:
-                task.status = 'failed'
-                task.next_round_at = None
-                task.completed_at = datetime.utcnow()
-                db.session.commit()
-                task_run_finish(task_key, 'failed', errors=['No groups left to send to'])
-                return None
-            api_id, api_hash = get_api_credentials(user_id)
-            proxy = get_proxy_for_account(user_id, account_id)
-            lock = get_account_lock(account_id)
-            # Book the NEXT round now. Two things depend on it: the scheduler stops
-            # seeing this campaign as "due" while the round is in flight, and a
-            # crash mid-round resumes after the interval instead of re-sending.
-            task.next_round_at = datetime.utcnow() + timedelta(seconds=between_rounds)
-            db.session.commit()
-
-        if not api_id:
-            with app.app_context():
-                t = BroadcastTask.query.get(task_id)
-                if t:
-                    t.status = 'failed'
-                    t.next_round_at = None
-                    db.session.commit()
-                task_run_finish(task_key, 'failed',
-                                errors=['Telegram API credentials not configured'])
-            return None
-
-        result = {'sent': 0, 'failed': 0, 'skipped': 0, 'errors': []}
-
-        async def _one_round():
-            client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
-            await client.connect()
-            try:
-                # Inside a round the messages go out one after another with only a
-                # 1s safety gap, so the whole round finishes quickly. The operator's
-                # delay is the wait BETWEEN rounds.
-                for group_id in group_ids:
-                    if task_should_stop(task_key):
-                        break
-                    try:
-                        entity = await client.get_entity(safe_int(group_id, 0) or group_id)
-                        if message_type in ('photo', 'video'):
-                            await client.send_file(entity, content, caption=caption or content)
-                        else:
-                            await client.send_message(entity, content)
-                        result['sent'] += 1
-                        task_run_update(task_key, sent=result['sent'], total=len(group_ids))
-                        await asyncio.sleep(1)
-                    except FloodWaitError as e:
-                        # Honour Telegram's wait — never bypass the rate limit.
-                        wait = min(safe_int(getattr(e, 'seconds', 0), 5), MAX_FLOOD_WAIT_SECONDS)
-                        result['skipped'] += 1
-                        note = f'rate limit — waited {wait}s, target skipped this round'
-                        result['errors'].append(note)
-                        task_run_update(task_key, skipped=result['skipped'], errors=[note])
-                        await asyncio.sleep(wait)
-                    except Exception as e:
-                        result['failed'] += 1
-                        note = friendly_telegram_error(e, str(group_id))
-                        result['errors'].append(note)
-                        task_run_update(task_key, failed=result['failed'], errors=[note])
-            finally:
-                await client.disconnect()
-            return result
-
-        with lock:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(_one_round())
-            finally:
-                loop.close()
-
-        stopped = task_should_stop(task_key)
-        with app.app_context():
-            task = BroadcastTask.query.get(task_id)
-            if not task:
-                return result
-            rounds_done = safe_int(task.rounds_done, 0) + 1
-            task.rounds_done = rounds_done
-            task.sent_count = safe_int(task.sent_count, 0) + result['sent']
-            lifetime_sent = task.sent_count
-            # rounds=0 means "keep going forever"; rounds=N means N rounds total.
-            more_rounds = (not stopped) and (repeat == 0 or rounds_done < repeat)
-            if more_rounds:
-                task.status = 'running'
-                task.next_round_at = datetime.utcnow() + timedelta(seconds=between_rounds)
-            else:
-                if stopped:
-                    final_status = 'stopped'
-                elif result['sent'] and not result['failed']:
-                    final_status = 'completed'
-                elif not result['sent']:
-                    final_status = 'failed'
-                else:
-                    final_status = 'partial'
-                task.status = final_status
-                task.next_round_at = None
-                task.completed_at = datetime.utcnow()
-            acc = TelegramAccount.query.get(account_id)
-            if acc and result['sent']:
-                acc.messages_sent_today = safe_int(acc.messages_sent_today, 0) + result['sent']
-                acc.total_messages = safe_int(acc.total_messages, 0) + result['sent']
-                acc.last_used = datetime.utcnow()
-            db.session.commit()
-            next_round_at = task.next_round_at
-            final_status = task.status
-
-        logger.info('Broadcast %s: round %s done (%s sent this round, %s lifetime), next round %s',
-                    task_id, rounds_done, result['sent'], lifetime_sent,
-                    next_round_at.isoformat() if next_round_at else 'not scheduled')
-        if more_rounds:
-            # Keep the progress card alive so the operator can see the wait.
-            task_run_update(task_key, status='running', sent=0, failed=0, skipped=0,
-                            total=len(group_ids))
-            task_run_update(task_key, errors=result['errors'])
-        else:
-            task_run_finish(task_key, final_status, sent=result['sent'],
-                            failed=result['failed'], skipped=result['skipped'])
-            log_activity(user_id,
-                         f"Broadcast #{task_id} {final_status}: {lifetime_sent} sent over "
-                         f"{rounds_done} round(s)",
-                         'success' if result['sent'] else 'failed', account_id)
-        if result['errors']:
-            logger.info('Broadcast %s issues: %s', task_id, ' | '.join(result['errors'][-5:]))
-        return result
-    except Exception as e:
-        logger.exception('broadcast_run_one_round(%s) failed: %s', task_id, e)
-        try:
-            with app.app_context():
-                t = BroadcastTask.query.get(task_id)
-                if t and (t.status or '') == 'running':
-                    t.status = 'failed'
-                    t.next_round_at = None
-                    t.completed_at = datetime.utcnow()
-                    db.session.commit()
-                task_run_finish(f'broadcast:{task_id}', 'failed',
-                                errors=[friendly_telegram_error(e)])
-        except Exception:
-            pass
-        return None
-    finally:
-        _broadcast_release(task_id)
-
-
-def close_stranded_legacy_campaigns():
-    """Close 'running' campaigns left behind by the old in-memory round loop.
-
-    Those rows have no task_key and no round bookkeeping, so nothing knows which
-    round they reached or whether the operator still wants them. Resuming one
-    would fire an unexpected round at every group it lists, so they are closed
-    instead and the operator restarts them deliberately from the dashboard.
-    Returns how many were closed.
-    """
-    closed = 0
-    try:
-        with app.app_context():
-            legacy = (BroadcastTask.query
-                      .filter(BroadcastTask.status == 'running',
-                              BroadcastTask.task_key.is_(None))
-                      .all())
-            for t in legacy:
-                t.status = 'stopped'
-                t.next_round_at = None
-                t.completed_at = t.completed_at or datetime.utcnow()
-                closed += 1
-            if closed:
-                db.session.commit()
-    except Exception as e:
-        logger.error('close_stranded_legacy_campaigns: %s', e)
-    return closed
-
-
-def run_broadcast_scheduler():
-    """Durable runner for Start-Now broadcast rounds. Survives restarts.
-
-    Every tick it looks for campaigns that are 'running' and due (or overdue, or
-    never booked because the process died before the first round). One thread per
-    due campaign; `_BROADCAST_INFLIGHT` makes sure a slow round is never started
-    twice.
-    """
-    logger.info('broadcast_scheduler started (tick %ss)', BROADCAST_TICK_SECONDS)
-    closed = close_stranded_legacy_campaigns()
-    if closed:
-        logger.info('broadcast_scheduler: closed %s stranded pre-upgrade campaign(s) '
-                    'instead of resuming them', closed)
-    while True:
-        try:
-            _BROADCAST_WAKE.wait(timeout=BROADCAST_TICK_SECONDS)
-            _BROADCAST_WAKE.clear()
-            now = datetime.utcnow()
-            with app.app_context():
-                rows = (BroadcastTask.query
-                        .filter(BroadcastTask.status == 'running')
-                        .order_by(BroadcastTask.id.asc())
-                        .limit(25).all())
-                due = [r.id for r in rows
-                       if r.next_round_at is None or r.next_round_at <= now]
-            for task_id in due:
-                # Claim here so a slow round is never spawned twice from two ticks.
-                if not _broadcast_claim(task_id):
-                    continue
-                threading.Thread(target=broadcast_run_one_round,
-                                 args=(task_id, True), daemon=True).start()
-        except Exception as e:
-            logger.error('broadcast_scheduler: %s', e)
-        time.sleep(1)
-
-
-@app.route('/bot/broadcast/campaigns')
-@login_required
-def broadcast_campaigns():
-    """Broadcast runs of this user, newest first — the same idea as the Auto Video
-    Poster campaign list, so a campaign stays visible (and removable) after it starts."""
-    rows = (TaskRun.query
-            .filter(TaskRun.user_id == current_user.id,
-                    TaskRun.task_key.like('broadcast:%'))
-            .order_by(TaskRun.id.desc())
-            .limit(25).all())
-    # Round bookkeeping lives on BroadcastTask, not on the progress row. Joining it
-    # in lets the card say "round 2 of 10 — next round in 3h 59m" instead of leaving
-    # the operator staring at a full progress bar wondering whether it is still alive.
-    ids = [i for i in (broadcast_task_id_from_key(r.task_key) for r in rows) if i]
-    meta = {}
-    if ids:
-        for t in BroadcastTask.query.filter(BroadcastTask.id.in_(ids)).all():
-            meta[t.id] = t
-    now = datetime.utcnow()
-    out = []
-    for r in rows:
-        age = None
-        if r.created_at:
-            age = max(0, int((now - r.created_at).total_seconds()))
-        errs = [e.strip() for e in (r.errors or '').splitlines() if e.strip()]
-        bt = meta.get(broadcast_task_id_from_key(r.task_key))
-        item = {
-            'id': r.id,
-            'task_key': r.task_key,
-            'status': r.status or 'running',
-            'sent': r.sent or 0,
-            'failed': r.failed or 0,
-            'skipped': r.skipped or 0,
-            'total': r.total or 0,
-            'errors': errs[-3:],
-            'created_at': r.created_at.isoformat() if r.created_at else None,
-            'age_seconds': age,
-            'rounds_done': 0,
-            'rounds_total': 1,
-            'next_round_in': None,
-            'lifetime_sent': 0,
-            'targets': 0,
-        }
-        if bt:
-            item['rounds_done'] = safe_int(bt.rounds_done, 0)
-            item['rounds_total'] = safe_int(bt.repeat, 1)
-            item['lifetime_sent'] = safe_int(bt.sent_count, 0)
-            try:
-                item['targets'] = len(json.loads(bt.groups or '[]'))
-            except (TypeError, ValueError):
-                item['targets'] = 0
-            if bt.next_round_at:
-                item['next_round_in'] = int((bt.next_round_at - now).total_seconds())
-        out.append(item)
-    return jsonify({'success': True, 'campaigns': out})
-
-
-@app.route('/bot/broadcast/campaigns/<int:run_id>', methods=['DELETE'])
-@login_required
-def broadcast_campaign_delete(run_id):
-    """Remove a broadcast from the list. A running one is stopped first."""
-    row = TaskRun.query.filter_by(id=run_id, user_id=current_user.id).first()
-    if not row:
-        return jsonify({'success': False, 'message': 'Not found'}), 404
-    was_running = (row.status or '') == 'running'
-    key = row.task_key
-    if was_running:
-        task_request_stop(key)
-    # Drop the durable campaign too, otherwise the scheduler would keep booking
-    # rounds for a campaign the operator has just deleted.
-    _bt_id = broadcast_task_id_from_key(key)
-    if _bt_id:
-        _bt = BroadcastTask.query.get(_bt_id)
-        if _bt:
-            db.session.delete(_bt)
-    db.session.delete(row)
-    db.session.commit()
-    try:
-        task_progress.pop(key, None)
-    except Exception:
-        pass
-    log_activity(current_user.id, f'Deleted broadcast campaign ({key})', 'info')
-    return jsonify({
-        'success': True,
-        'message': 'Removed.' + (' The running broadcast was stopped first.' if was_running else ''),
-    })
-
-
-@app.route('/bot/task/<path:task_key>/stop', methods=['POST'])
-@login_required
-def stop_task(task_key):
-    """Stop a running task. Safe to call twice."""
-    task_request_stop(task_key)
-    # A broadcast's next round is re-booked from the database, so a stop has to
-    # clear the durable row as well — otherwise the campaign comes straight back
-    # on the next scheduler tick.
-    stop_broadcast_task_for_key(task_key)
-    log_activity(current_user.id, f'Stop requested for {task_key}', 'info')
-    return jsonify({
-        'success': True,
-        'message': 'Stop requested — the run ends after the message already in flight.',
-    })
 
 
 def task_run_snapshot(task_key):
@@ -1809,12 +1343,6 @@ def login():
         return redirect(url_for('dashboard'))
     if request.method == 'POST':
         username = clean_str(request.form.get('username'))
-        # The account row is always 'admin' (ADMIN_USERS, the admin panel and the
-        # boot-time recovery all key off that exact name), but operators sign in
-        # as "MRADS" — treat it as an alias instead of renaming the row, which
-        # would make the app recreate a second 'admin' account on the next boot.
-        if username.lower() in ('mrads', 'mrads_tg', 'mradstg'):
-            username = 'admin'
         password = request.form.get('password') or ''
         try:
             user = User.query.filter_by(username=username).first()
@@ -1874,7 +1402,16 @@ def register():
         db.session.add(user)
         db.session.commit()
         log_activity(user.id, f'Registered new dashboard user {username}', 'success')
-        return jsonify({'success': True, 'message': 'Account created successfully'})
+        # Sign the new user straight in: registration is the first step of using
+        # the dashboard, so making them type the same details again is pointless.
+        try:
+            login_user(user, remember=True)
+            user.last_login_at = datetime.utcnow()
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return jsonify({'success': True, 'message': 'Account created successfully',
+                        'redirect': url_for('dashboard')})
     except Exception as e:
         logger.error('register error: %s', e)
         return jsonify({'error': 'Could not create the account right now'}), 500
@@ -3240,12 +2777,11 @@ def send_personal_message():
         access_hash = safe_int(data.get('access_hash'), 0) or None
         username = clean_str(data.get('username')) or None
         message = clean_str(data.get('message'))
-        media_path = clean_str(data.get('media_path'))
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
-        if not target_id or (not message and not media_path):
-            return jsonify({'success': False, 'error': 'Target and message (or a photo/video) required'}), 400
+        if not target_id or not message:
+            return jsonify({'success': False, 'error': 'Target and message required'}), 400
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -3266,14 +2802,14 @@ def send_personal_message():
                 async def _deliver():
                     if username:
                         # Username is the most reliable peer — Telegram resolves it directly
-                        return await _deliver_media_or_text(client, username, message, media_path)
+                        return await client.send_message(username, message)
                     if access_hash:
                         # InputPeerUser avoids an entity lookup
                         peer = types.InputPeerUser(user_id=target_id, access_hash=access_hash)
-                        return await _deliver_media_or_text(client, peer, message, media_path)
+                        return await client.send_message(peer, message)
                     # Last resort: warm the dialog cache, then send by id
                     await client.get_dialogs(limit=1)
-                    return await _deliver_media_or_text(client, target_id, message, media_path)
+                    return await client.send_message(target_id, message)
 
                 try:
                     return await _deliver()
@@ -3664,60 +3200,101 @@ def broadcast():
         if not api_id:
             return jsonify({'success': False, 'error': 'Telegram API credentials not configured'}), 400
 
-        # One durable campaign per account at a time. account_busy() only covers a
-        # round that is in flight; a campaign waiting between rounds does not hold the
-        # account lock, so this closes that gap.
-        already = (BroadcastTask.query
-                   .filter_by(account_id=account_id, status='running').first())
-        if already:
-            return jsonify({
-                'success': False,
-                'error': f'Campaign #{already.id} is already running on this account. '
-                         f'Stop it first.',
-            }), 409
-
-        # How many ROUNDS to send. 1 = one round over every group then finish (safe
-        # default, and what every pre-existing campaign expects). 0 = keep repeating:
-        # a full round of all groups, wait `delay`, then all groups again, until Stop.
-        repeat = safe_int(data.get('repeat'), 1, minimum=0, maximum=100000)
-
         task = BroadcastTask(
             user_id=current_user.id,
             account_id=account_id,
             message_type=message_type,
             content=content,
-            caption=caption,
             groups=json.dumps(group_ids),
             delay=delay,
-            repeat=repeat,
-            rounds_done=0,
-            next_round_at=datetime.utcnow(),
-            status='running',
+            status='running'
         )
         db.session.add(task)
-        # flush (not commit) so the row has its id, then put task_key in the SAME
-        # commit. A row that is 'running' with a NULL task_key would be mistaken
-        # for a stranded pre-upgrade campaign by the boot sweep.
-        db.session.flush()
-        task_id = task.id
-        task_key = f'broadcast:{task_id}'
-        task.task_key = task_key
         db.session.commit()
-        task_run_start(current_user.id, 'broadcast', len(group_ids), task_key=task_key)
+        task_id = task.id
+        task_key = task_run_start(current_user.id, 'broadcast', len(group_ids), task_key=f'broadcast:{task_id}')
+        user_id = current_user.id
+        sess = account.session_string
+        lock = get_account_lock(account_id)
 
-        # Round 1 starts right here so "Start Now" is instant. Rounds 2..N — and any
-        # resume after a restart — are owned by the durable scheduler above, which
-        # reads next_round_at out of the database. Claiming first means the scheduler
-        # cannot start a second, duplicate round 1.
-        if _broadcast_claim(task_id):
-            threading.Thread(target=broadcast_run_one_round,
-                             args=(task_id, True), daemon=True).start()
-        _BROADCAST_WAKE.set()
+        def run_broadcast():
+            with lock:
+                with app.app_context():
+                    proxy = get_proxy_for_account(user_id, account_id)
+                    result = {'sent': 0, 'failed': 0, 'skipped': 0, 'errors': []}
 
-        rounds_note = f'every {delay}s' if repeat == 0 else f'{repeat} round(s)'
-        log_activity(current_user.id,
-                     f'Broadcast #{task_id} started to {len(group_ids)} groups ({rounds_note})',
-                     'success', account_id)
+                    async def _broadcast():
+                        client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
+                        await client.connect()
+                        try:
+                            for group_id in group_ids:
+                                try:
+                                    entity = await client.get_entity(safe_int(group_id, 0) or group_id)
+                                    if message_type in ('photo', 'video'):
+                                        await client.send_file(entity, content, caption=caption or content)
+                                    else:
+                                        await client.send_message(entity, content)
+                                    result['sent'] += 1
+                                    task_run_update(task_key, sent=result['sent'])
+                                    await asyncio.sleep(delay)
+                                except FloodWaitError as e:
+                                    # Honour Telegram's wait — never bypass the rate limit.
+                                    wait = min(safe_int(getattr(e, 'seconds', 0), 5), MAX_FLOOD_WAIT_SECONDS)
+                                    result['skipped'] += 1
+                                    note = f'rate limit — waited {wait}s, target skipped this run'
+                                    result['errors'].append(note)
+                                    task_run_update(task_key, skipped=result['skipped'], errors=[note])
+                                    await asyncio.sleep(wait)
+                                except Exception as e:
+                                    result['failed'] += 1
+                                    note = friendly_telegram_error(e, str(group_id))
+                                    result['errors'].append(note)
+                                    task_run_update(task_key, failed=result['failed'], errors=[note])
+                        finally:
+                            await client.disconnect()
+                        return result
+
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            result = loop.run_until_complete(_broadcast())
+                        finally:
+                            loop.close()
+                        # A run with zero confirmed sends is NOT a success.
+                        final_status = 'completed' if result['sent'] and not result['failed'] else (
+                            'failed' if not result['sent'] else 'partial'
+                        )
+                        t = BroadcastTask.query.get(task_id)
+                        acc = TelegramAccount.query.get(account_id)
+                        if t:
+                            t.sent_count = result['sent']
+                            t.status = final_status
+                            t.completed_at = datetime.utcnow()
+                        if acc:
+                            acc.messages_sent_today += result['sent']
+                            acc.total_messages += result['sent']
+                            acc.last_used = datetime.utcnow()
+                        db.session.commit()
+                        task_run_finish(
+                            task_key, final_status,
+                            sent=result['sent'], failed=result['failed'], skipped=result['skipped'],
+                        )
+                        summary = (f"Broadcast finished: {result['sent']} sent, "
+                                   f"{result['failed']} failed, {result['skipped']} skipped")
+                        log_activity(user_id, summary, 'success' if result['sent'] else 'failed', account_id)
+                        if result['errors']:
+                            logger.info('Broadcast %s issues: %s', task_id, ' | '.join(result['errors'][-5:]))
+                    except Exception as e:
+                        t = BroadcastTask.query.get(task_id)
+                        if t:
+                            t.status = 'failed'
+                            t.completed_at = datetime.utcnow()
+                            db.session.commit()
+                        task_run_finish(task_key, 'failed', errors=[friendly_telegram_error(e)])
+                        logger.error('Broadcast thread error: %s', e)
+
+        threading.Thread(target=run_broadcast, daemon=True).start()
         return jsonify({
             'success': True,
             'message': f'Broadcast started to {len(group_ids)} groups',
@@ -4209,7 +3786,7 @@ def add_members():
                                 from telethon.tl.functions.messages import AddChatUserRequest as AddChatUserReq
                                 await client(AddChatUserReq(chat_id=entity.id, user_id=user_ent, fwd_limit=0))
                             added += 1
-                            await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                            await asyncio.sleep(delay)
                         except FloodWaitError as e:
                             await asyncio.sleep(e.seconds)
                         except Exception as e:
@@ -4251,13 +3828,12 @@ def send_dm():
             clean_str(u).lstrip('@') for u in (data.get('usernames') or []) if clean_str(u)
         ])
         message = clean_str(data.get('message'))
-        media_path = clean_str(data.get('media_path'))
         delay = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
-        if not usernames or (not message and not media_path):
-            return jsonify({'success': False, 'error': 'Usernames and a message (or photo/video) required'}), 400
+        if not usernames or not message:
+            return jsonify({'success': False, 'error': 'Usernames and message required'}), 400
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -4290,10 +3866,10 @@ def send_dm():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await _deliver_media_or_text(client, uname, message, media_path)
+                                        await client.send_message(uname, message)
                                         result['sent'] += 1
                                         task_run_update(task_key, sent=result['sent'])
-                                        await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                        await asyncio.sleep(delay)
                                         break
                                     except FloodWaitError as e:
                                         attempt += 1
@@ -4362,11 +3938,10 @@ def send_dm_multi():
         account_ids = dedupe_preserve([safe_int(x, 0) for x in (data.get('account_ids') or []) if safe_int(x, 0)])
         usernames   = dedupe_preserve([clean_str(u).lstrip('@') for u in (data.get('usernames') or []) if clean_str(u)])
         message     = clean_str(data.get('message'))
-        media_path  = clean_str(data.get('media_path'))
         delay       = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
 
-        if not account_ids or not usernames or (not message and not media_path):
-            return jsonify({'success': False, 'error': 'Accounts, usernames, and a message (or photo/video) required'}), 400
+        if not account_ids or not usernames or not message:
+            return jsonify({'success': False, 'error': 'Accounts, usernames, and message required'}), 400
 
         # Validate every account up front: the UI must not be told "started"
         # while an unowned/disconnected account silently does nothing.
@@ -4416,9 +3991,9 @@ def send_dm_multi():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await _deliver_media_or_text(client, uname, message, media_path)
+                                        await client.send_message(uname, message)
                                         result['sent'] += 1
-                                        await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                        await asyncio.sleep(delay)
                                         break
                                     except FloodWaitError as e:
                                         attempt += 1
@@ -4507,17 +4082,13 @@ def dm_campaign():
         messages = [clean_str(m) for m in (data.get('messages') or []) if clean_str(m)]
         delay = safe_int(data.get('delay'), 5, minimum=3, maximum=MAX_DELAY_SECONDS)
         personalize = safe_bool(data.get('personalize'), False)
-        media_path = clean_str(data.get('media_path'))
 
         if not account_id:
             return jsonify({'success': False, 'error': 'Select an account first'}), 400
         if not targets:
             return jsonify({'success': False, 'error': 'No targets provided'}), 400
-        if not messages and not media_path:
+        if not messages:
             return jsonify({'success': False, 'error': 'No messages provided'}), 400
-        if media_path and not messages:
-            # Media-only campaign: the caption is empty, no template needed.
-            messages = ['']
 
         account = get_account_for_current_user(account_id)
         if not account:
@@ -4569,10 +4140,10 @@ def dm_campaign():
                                 attempt = 0
                                 while True:
                                     try:
-                                        await _deliver_media_or_text(client, username, msg, media_path)
+                                        await client.send_message(username, msg)
                                         result['sent'] += 1
                                         task_run_update(task_id, sent=result['sent'], skipped=result['skipped'])
-                                        await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                        await asyncio.sleep(delay)
                                         break
                                     except FloodWaitError as e:
                                         attempt += 1
@@ -5241,7 +4812,7 @@ def run_scheduled_broadcasts():
                                                         await client.send_file(entity, content, caption=caption or content)
                                                     result['sent'] += 1
                                                     task_run_update(task_key, sent=result['sent'])
-                                                    await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                                    await asyncio.sleep(delay)
                                                     break
                                                 except FloodWaitError as e:
                                                     attempt += 1
@@ -5421,7 +4992,7 @@ def add_members_multi():
                                 task_progress[task_id]['total_added'] = sum(
                                     v['added'] for v in task_progress[task_id]['accounts'].values()
                                 )
-                                await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                await asyncio.sleep(delay)
                             except FloodWaitError as e:
                                 await asyncio.sleep(e.seconds)
                             except Exception as e:
@@ -5871,7 +5442,7 @@ def forward_messages():
                                             await client.forward_messages(target_entity, message_id, source_entity)
                                             result['forwarded'] += 1
                                             task_run_update(task_key, sent=result['forwarded'])
-                                            await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                            await asyncio.sleep(delay)
                                             break
                                         except FloodWaitError as e:
                                             attempt += 1
@@ -7112,42 +6683,6 @@ except OSError as exc:                       # pragma: no cover - environment de
     logger.warning('Could not create media root %s: %s', AUTO_VIDEO_ROOT, exc)
 ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v'}
 
-# ─── DEVICE UPLOADS FOR THE MESSAGING TOOLS ──────────────────────────────────
-# Photos/videos picked straight from the operator's device are stored here and
-# the absolute path is handed back to the existing senders (they already accept
-# local paths), so no sender had to change. Same candidate order as the
-# auto-poster: explicit env dir > /data volume > app directory.
-ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-ALLOWED_MEDIA_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS
-
-
-def _resolve_messaging_media_root():
-    candidates = []
-    configured = (os.environ.get('MESSAGING_MEDIA_DIR') or '').strip()
-    if configured:
-        candidates.append(configured)
-    candidates.append(os.path.join(os.sep, 'data', 'messaging_media'))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'messaging_media'))
-    for candidate in candidates:
-        try:
-            os.makedirs(candidate, exist_ok=True)
-            probe = os.path.join(candidate, '.write_probe')
-            with open(probe, 'w', encoding='utf-8') as fh:
-                fh.write('ok')
-            os.remove(probe)
-            return candidate
-        except Exception:
-            continue
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'messaging_media')
-
-
-MESSAGING_MEDIA_ROOT = _resolve_messaging_media_root()
-
-# campaign_id -> Thread for every round this process is currently running.
-# Guarantees that a campaign can never be posted by two threads at once.
-_AVP_ACTIVE = {}
-_AVP_ACTIVE_LOCK = threading.Lock()
-
 
 def _safe_extract_videos(zip_path, destination):
     """Extract supported video files safely. Returns (extracted_paths, skipped_names).
@@ -7201,53 +6736,6 @@ def _auto_caption(template, name, index, total, channel=None):
             .replace('{index}', str(index + 1))
             .replace('{total}', str(total))
             .replace('{channel}', str(channel or '')))
-
-
-def _parse_caption_pool(raw):
-    """Split a caption pool into individual captions.
-
-    Captions are separated by a line containing only dashes (---). A separator is
-    used instead of "one caption per line" so that a single caption may still span
-    several lines (the caption box has always allowed that).
-    """
-    text = (raw or '').replace('\r\n', '\n').replace('\r', '\n').strip()
-    if not text:
-        return []
-    # The dashboard sends an explicit JSON array (one entry per caption box), which
-    # is unambiguous; a plain string is also accepted and split on dash lines.
-    if text.startswith('['):
-        try:
-            loaded = json.loads(text)
-            if isinstance(loaded, list):
-                return [str(p).strip() for p in loaded if str(p).strip()]
-        except Exception:
-            pass
-    parts, current = [], []
-    for line in text.split('\n'):
-        stripped = line.strip()
-        if len(stripped) >= 3 and set(stripped) == {'-'}:
-            parts.append('\n'.join(current))
-            current = []
-        else:
-            current.append(line)
-    parts.append('\n'.join(current))
-    return [p.strip() for p in parts if p and p.strip()]
-
-
-def _campaign_captions(campaign):
-    """The caption pool of a campaign, falling back to the single caption field."""
-    pool = []
-    try:
-        loaded = json.loads(campaign.captions or '[]')
-        if isinstance(loaded, list):
-            pool = [str(p) for p in loaded if str(p).strip()]
-    except Exception:
-        pool = []
-    if pool:
-        return pool
-    if (campaign.caption or '').strip():
-        return [campaign.caption]
-    return ['']
 
 
 def _zip_videos(media_dir):
@@ -7416,11 +6904,6 @@ def auto_video_post_create():
         source_type = (clean_str(request.form.get('source_type'), 'zip') or 'zip').lower()
         channels_raw = clean_str(request.form.get('channels'))
         caption = clean_str(request.form.get('caption'))
-        # Multiple captions: one per "---" separated block. A random one is picked
-        # per round; if none are given we fall back to the single caption field.
-        caption_pool = _parse_caption_pool(request.form.get('captions'))
-        if not caption_pool and caption:
-            caption_pool = [caption]
         min_delay = safe_int(request.form.get('min_delay'), 5, minimum=AUTO_POST_DELAY_MIN, maximum=AUTO_POST_DELAY_MAX)
         max_delay = safe_int(request.form.get('max_delay'), 15, minimum=min_delay, maximum=AUTO_POST_DELAY_MAX)
 
@@ -7556,7 +7039,6 @@ def auto_video_post_create():
             channels=json.dumps(channels),
             media_dir=media_dir,
             caption=caption,
-            captions=json.dumps(caption_pool),
             min_delay=min_delay,
             max_delay=max_delay,
             current_index=0,
@@ -7631,8 +7113,6 @@ def auto_video_post_list():
             'source': 'Saved Messages' if (c.source_type == 'saved_messages') else 'ZIP files',
             'source_type': c.source_type or 'zip',
             'min_delay': c.min_delay, 'max_delay': c.max_delay,
-            'captions': _campaign_captions(c),
-            'caption_pool_size': len(_campaign_captions(c)),
             'next_run_at': c.next_run_at.strftime('%Y-%m-%d %H:%M:%S') if c.next_run_at else None,
             'last_post_at': c.last_post_at.strftime('%Y-%m-%d %H:%M:%S') if c.last_post_at else None,
             'last_error': c.last_error or '',
@@ -7816,60 +7296,11 @@ async def _resolve_channel_entity(client, channel):
 
 
 def _run_auto_post_round(campaign_id):
-    """Run one posting round, guaranteeing at most one round per campaign.
-
-    The scheduler re-arms a 'posting' campaign once its heartbeat looks stale.
-    A round that is legitimately slow looked stale by that rule, so a second
-    thread posted the same video to the same channel. The in-process registry
-    below makes that impossible while the round is alive.
-    """
-    with _AVP_ACTIVE_LOCK:
-        if campaign_id in _AVP_ACTIVE:
-            logger.warning(
-                'Auto Video Poster: a round for campaign %s is already running in this '
-                'process — not starting a second one', campaign_id,
-            )
-            return
-        _AVP_ACTIVE[campaign_id] = threading.current_thread()
-    try:
-        _run_auto_post_round_body(campaign_id)
-    except Exception:
-        # The body records its own failures; this only catches something that
-        # escaped it. The thread must not die silently, and the registry entry
-        # must go in every case.
-        logger.exception('auto_video_post round crashed for campaign %s', campaign_id)
-    finally:
-        with _AVP_ACTIVE_LOCK:
-            _AVP_ACTIVE.pop(campaign_id, None)
-
-
-def _avp_active_count():
-    """How many rounds this process is currently running."""
-    with _AVP_ACTIVE_LOCK:
-        return len(_AVP_ACTIVE)
-
-
-def _run_auto_post_round_body(campaign_id):
     """Execute a single posting round for one campaign (called in its own thread)."""
     with app.app_context():
         campaign = AutoVideoPostCampaign.query.get(campaign_id)
         if not campaign:
             return
-        # When this round STARTED. The inter-round interval is measured from here,
-        # not from when the round finishes (see the scheduling block at the end).
-        round_started = datetime.utcnow()
-        # Self-heal the campaign folder. It is created when the campaign is created,
-        # so on an ephemeral Railway disk it disappears on every redeploy while the
-        # campaign row survives in PostgreSQL. Any later os.listdir/open on that
-        # path then died with:
-        #   [Errno 2] No such file or directory: '/data/auto_post_media/<uid>'
-        # which failed the whole round (0 posted) and parked the error on the card.
-        if campaign.media_dir:
-            try:
-                os.makedirs(campaign.media_dir, exist_ok=True)
-            except OSError as exc:
-                logger.warning('auto_video_post: could not create media dir %s: %s',
-                               campaign.media_dir, exc)
         try:
             acc = TelegramAccount.query.get(campaign.account_id)
             api_id, api_hash = get_api_credentials(campaign.user_id)
@@ -7924,11 +7355,6 @@ def _run_auto_post_round_body(campaign_id):
             async def send_round():
                 client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                 await client.connect()
-                # Pick ONE caption for this whole round, before the channel loop, so
-                # every channel in the round posts the same caption text (and the
-                # choice is not re-rolled per channel).
-                _pool = _campaign_captions(campaign)
-                round_caption = random.choice(_pool) if _pool else ''
                 try:
                     for channel in channels:
                         # Stop promptly when the operator paused/deleted the campaign.
@@ -7984,28 +7410,8 @@ def _run_auto_post_round_body(campaign_id):
                                         break
                                     payload = source_msg if source_msg is not None else ref
 
-                                # Hard guard before handing anything to Telegram. A wiped
-                                # ephemeral disk (Railway /data without a volume) used to surface
-                                # here as
-                                #   [Errno 2] No such file or directory: '/data/auto_post_media/<uid>'
-                                # and it failed the ENTIRE round, so nothing was posted and the
-                                # operator saw "0 posted" plus a confusing filesystem error. A path
-                                # that is missing (or is a folder) is now a clean per-channel skip:
-                                # the round keeps going and the reason is stated in plain words.
-                                if payload is None or (
-                                    isinstance(payload, str)
-                                    and (os.path.isdir(payload) or not os.path.exists(payload))
-                                ):
-                                    counters['skipped'] += 1
-                                    errors.append(
-                                        f'{channel}: media for {name} is not on the server and has no '
-                                        f'Telegram copy yet — skipped'
-                                    )
-                                    queue['position'] += 1
-                                    break
-
                                 entity = await _resolve_channel_entity(client, channel)
-                                caption = _auto_caption(round_caption, name, index, library_total, channel)
+                                caption = _auto_caption(campaign.caption, name, index, library_total, channel)
                                 sent = await client.send_file(entity, payload, caption=caption or None)
                                 if not sent:
                                     raise RuntimeError('Telegram did not confirm the post')
@@ -8064,56 +7470,20 @@ def _run_auto_post_round_body(campaign_id):
             )
             campaign.last_error = '\n'.join(errors[-10:]) if errors else None
             campaign.worker_heartbeat = datetime.utcnow()
-            # Persist the real counters first, then re-read the row: the operator may
-            # have pressed Pause (a different request/session) while this round was
-            # running. Previously the tail wrote 'running' unconditionally, so Pause
-            # appeared to work and then silently reverted itself.
-            db.session.commit()
-            try:
-                db.session.refresh(campaign)
-            except Exception:
-                pass
-            if campaign.stop_requested or campaign.status == 'paused':
+            if campaign.stop_requested:
                 campaign.stop_requested = False
                 campaign.status = 'paused'
-                campaign.next_run_at = None      # nothing may be scheduled while paused
             else:
-                if campaign.status == 'posting':
-                    campaign.status = 'running'
+                campaign.status = 'running'
                 low = max(1, campaign.min_delay) * 60
                 high = max(low, max(1, campaign.max_delay) * 60)
-                delay_seconds = random.randint(low, high)
                 if not counters['posted']:
-                    # Nothing got through (rate limit / permissions / wiped library).
-                    # Wait at least 2 minutes so we do not hammer a rate-limited
-                    # account, but never longer than the operator's own range: the
-                    # old code doubled the delay and floored it at 5-15 minutes,
-                    # which silently overrode a "3 minutes" setting. A round that
-                    # hits a real flood wait already sleeps inside the round loop.
-                    delay_seconds = max(delay_seconds, 120)
-                    logger.info(
-                        'auto_video_post campaign %s: round posted nothing (%s), '
-                        'waiting %ss (operator range %ss-%ss)',
-                        campaign_id, campaign.last_round_summary, delay_seconds,
-                        max(1, campaign.min_delay) * 60, max(1, campaign.max_delay) * 60,
-                    )
-                # The interval is start-to-start. A round posts one video per
-                # channel, so it can take many minutes by itself; adding the whole
-                # delay on top of the round's own duration is what made a "3 minute"
-                # setting behave like 10-20 minutes.
-                target = round_started + timedelta(seconds=delay_seconds)
-                now = datetime.utcnow()
-                if target <= now:
-                    # The round overran its own interval: go again after a short
-                    # guard instead of waiting one more full period.
-                    campaign.next_run_at = now + timedelta(seconds=5)
-                    logger.info(
-                        'auto_video_post campaign %s: round took longer than the %ss '
-                        'interval, re-arming in 5s',
-                        campaign_id, delay_seconds,
-                    )
-                else:
-                    campaign.next_run_at = target
+                    # Nothing got through (rate limit / permissions / wiped library):
+                    # wait longer instead of hammering, but stay in the loop.
+                    low, high = max(low * 2, 300), max(high * 2, 900)
+                campaign.next_run_at = datetime.utcnow() + timedelta(
+                    seconds=random.randint(low, high)
+                )
             db.session.commit()
             # "campaign started" is never reported as success — these are real counts.
             log_activity(
@@ -8124,20 +7494,10 @@ def _run_auto_post_round_body(campaign_id):
             )
         except Exception as e:
             campaign = AutoVideoPostCampaign.query.get(campaign_id)
-            if campaign is not None:
-                # Re-read the row: the operator may have paused or deleted the
-                # campaign (from another request, i.e. another session) while this
-                # round was running. A stale in-session copy would otherwise
-                # resurrect a campaign the operator had just switched off.
-                try:
-                    db.session.refresh(campaign)
-                except Exception:
-                    campaign = None
-            if campaign is not None:
-                if campaign.status in ('posting', 'running'):
-                    campaign.status = 'running'
-                    campaign.next_run_at = datetime.utcnow() + timedelta(minutes=5)
+            if campaign:
+                campaign.status = 'running'
                 campaign.last_error = friendly_telegram_error(e)
+                campaign.next_run_at = datetime.utcnow() + timedelta(minutes=5)
                 campaign.worker_heartbeat = datetime.utcnow()
                 db.session.commit()
             logger.exception('auto_video_post round failed for campaign %s', campaign_id)
@@ -8164,18 +7524,7 @@ def run_auto_video_post_scheduler():
                     for stuck in AutoVideoPostCampaign.query.filter(
                         AutoVideoPostCampaign.status == 'posting'
                     ).all():
-                        # A round owned by a LIVE thread in this process is never
-                        # "recovered" — doing so started a duplicate round, which
-                        # posted the same video to the same channel twice.
-                        with _AVP_ACTIVE_LOCK:
-                            still_alive = stuck.id in _AVP_ACTIVE
-                        if still_alive:
-                            continue
                         if not stuck.worker_heartbeat or stuck.worker_heartbeat < stale_cutoff:
-                            logger.warning(
-                                'Auto Video Poster: campaign %s was stuck in "posting" with no '
-                                'worker — re-arming it', stuck.id,
-                            )
                             stuck.status = 'running'
                             stuck.worker_heartbeat = now
                     db.session.commit()
@@ -8185,18 +7534,6 @@ def run_auto_video_post_scheduler():
                         AutoVideoPostCampaign.next_run_at <= now
                     ).limit(MAX_SCHEDULED_BATCH).all()
                     for c in campaigns:
-                        with _AVP_ACTIVE_LOCK:
-                            already_running = c.id in _AVP_ACTIVE
-                        if already_running:
-                            continue
-                        # Honour the operator's concurrency ceiling.
-                        if AUTO_POST_MAX_CONCURRENT and _avp_active_count() >= AUTO_POST_MAX_CONCURRENT:
-                            logger.info(
-                                'Auto Video Poster: %s concurrent rounds already running — '
-                                'campaign %s waits for the next tick',
-                                AUTO_POST_MAX_CONCURRENT, c.id,
-                            )
-                            break
                         c.status = 'posting'
                         c.worker_heartbeat = now
                         db.session.commit()
@@ -8213,92 +7550,6 @@ def run_auto_video_post_scheduler():
 # ═══════════════════════════════════════════════════════════════════════════════
 # ─── SAVED TARGETS + APP CONFIG + DATABASE HEALTH ─────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
-
-async def _deliver_media_or_text(client, peer, text, media_path=None):
-    """Send plain text, or a device-uploaded photo/video using the text as caption.
-
-    Used by every messaging tool (personal chat, bulk DM, DM campaign, channel
-    post) so a single upload path covers them all. Existing text-only behaviour
-    is unchanged when media_path is empty.
-    """
-    media_path = (media_path or '').strip()
-    if media_path:
-        if not os.path.exists(media_path):
-            raise FileNotFoundError(
-                'The uploaded photo/video is no longer on the server (temporary disk). '
-                'Re-upload it and try again.')
-        return await client.send_file(peer, media_path, caption=(text or None))
-    return await client.send_message(peer, text)
-
-
-@app.route('/bot/upload_media', methods=['POST'])
-@login_required
-def upload_media():
-    """Accept a photo or video straight from the operator's device.
-
-    The dashboard posts one or more files here, gets back the stored absolute
-    path and drops it into the existing "media URL/path" field, so Broadcast,
-    Scheduled Broadcast, Group Message and Channel Post can all send it without
-    the operator needing a public URL.
-    """
-    files = request.files.getlist('file') or request.files.getlist('files')
-    files = [f for f in files if f and clean_str(f.filename)]
-    if not files:
-        return jsonify({'success': False, 'error': 'No file received'}), 400
-
-    saved = []
-    for stored in files:
-        original = clean_str(stored.filename)
-        ext = os.path.splitext(original)[1].lower()
-        if ext not in ALLOWED_MEDIA_EXTENSIONS:
-            return jsonify({
-                'success': False,
-                'error': (f"'{original}' is not a supported media type. "
-                          "Photos: jpg, jpeg, png, webp, gif. Videos: mp4, mov, mkv, webm, avi, m4v."),
-            }), 400
-        safe = secure_filename(original) or 'upload'
-        name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe}"
-        target = os.path.join(MESSAGING_MEDIA_ROOT, name)
-        try:
-            stored.save(target)
-        except Exception as e:
-            logger.error('Media upload failed: %s', e)
-            return jsonify({'success': False, 'error': f'Could not store {original}: {e}'}), 500
-        size = os.path.getsize(target) if os.path.exists(target) else 0
-        if size == 0:
-            try:
-                os.remove(target)
-            except OSError:
-                pass
-            return jsonify({'success': False, 'error': f"'{original}' is empty"}), 400
-        saved.append({
-            'name': name,
-            'original_name': original,
-            'path': target,
-            'url': url_for('messaging_media', filename=name),
-            'kind': 'photo' if ext in ALLOWED_IMAGE_EXTENSIONS else 'video',
-            'size': size,
-            'persistent': MESSAGING_MEDIA_ROOT.startswith(os.path.join(os.sep, 'data') + os.sep)
-                          or bool(os.environ.get('MESSAGING_MEDIA_DIR')),
-        })
-
-    first = saved[0]
-    log_activity(current_user.id,
-                 f"Uploaded {first['kind']} from device: {first['original_name']} "
-                 f"({round(first['size'] / 1048576, 2)} MB)",
-                 'success')
-    return jsonify({'success': True, 'file': first, 'files': saved})
-
-
-@app.route('/media/<path:filename>')
-@login_required
-def messaging_media(filename):
-    """Serve an uploaded photo/video back to the dashboard so it can preview it."""
-    try:
-        return send_from_directory(MESSAGING_MEDIA_ROOT, filename)
-    except Exception:
-        return jsonify({'success': False, 'error': 'File not found'}), 404
-
 
 @app.route('/bot/app_config')
 @login_required
@@ -8420,10 +7671,9 @@ def channel_post_create():
     channel         = data.get('channel', '').strip()
     content         = data.get('content', '').strip()
     message_type    = data.get('message_type', 'text')
-    media_path      = clean_str(data.get('media_path'))
     dt_local        = data.get('scheduled_at', '')
     repeat_interval = safe_int(data.get('repeat_interval'), 0)
-    if not channel or not (content or media_path) or not dt_local:
+    if not channel or not content or not dt_local:
         return jsonify({'success': False, 'error': 'Fill all fields'})
     acc = get_account_for_current_user(account_id)
     if not acc:
@@ -8435,8 +7685,7 @@ def channel_post_create():
     post = ChannelScheduledPost(user_id=current_user.id, account_id=account_id,
                                 channel=channel, content=content,
                                 message_type=message_type, scheduled_at=scheduled_at,
-                                repeat_interval=repeat_interval,
-                                media_path=media_path or None)
+                                repeat_interval=repeat_interval)
     db.session.add(post)
     db.session.commit()
     return jsonify({'success': True, 'message': f'Post scheduled for {scheduled_at.strftime("%Y-%m-%d %H:%M")}'})
@@ -8489,26 +7738,18 @@ def run_channel_post_scheduler():
                         channel = post.channel
                         content = post.content
                         mtype   = post.message_type
-                        media   = post.media_path
                         sess    = acc.session_string
                         repeat  = post.repeat_interval
                         user_id = post.user_id
                         account_id = post.account_id
 
                         async def _send(sess=sess, api_id=api_id, api_hash=api_hash, proxy=proxy,
-                                        channel=channel, content=content, mtype=mtype, media=media):
+                                        channel=channel, content=content, mtype=mtype):
                             client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                             await client.connect()
                             try:
                                 entity = await client.get_entity(channel)
-                                if media:
-                                    # Device-uploaded photo/video: the text becomes the caption.
-                                    if not os.path.exists(media):
-                                        raise FileNotFoundError(
-                                            'Uploaded media is no longer on the server '
-                                            '(ephemeral disk). Re-upload it for this post.')
-                                    await client.send_file(entity, media, caption=content or None)
-                                elif mtype == 'text' or not content:
+                                if mtype == 'text':
                                     await client.send_message(entity, content)
                                 else:
                                     await client.send_file(entity, content)
@@ -8780,10 +8021,14 @@ def umgmt_create_user():
         return jsonify({'success': False, 'error': 'Username and password required'})
     if User.query.filter_by(username=username).first():
         return jsonify({'success': False, 'error': 'Username already exists'})
+    if len(username) < 3 or len(password) < 6:
+        return jsonify({'success': False,
+                        'error': 'Username must be 3+ characters and password 6+ characters'})
     user = User(username=username, password=generate_password_hash(password))
     db.session.add(user)
     db.session.commit()
-    return jsonify({'success': True, 'message': f'User {username} created'})
+    return jsonify({'success': True, 'message': f'User {username} created',
+                    'user': {'id': user.id, 'username': user.username}})
 
 
 @app.route('/bot/admin/change_password', methods=['POST'])
@@ -9075,7 +8320,7 @@ def run_member_alert_bot():
                                             try:
                                                 await client.send_message(user, welcome)
                                                 new_users.append(user.id)
-                                                await asyncio.sleep(1)  # 1s safety gap between targets — a whole pass now finishes fast
+                                                await asyncio.sleep(delay)
                                             except Exception:
                                                 pass
                             finally:
@@ -9768,7 +9013,6 @@ def run_generic_scheduler():
 # Columns that may be missing on databases created by an older version.
 # Format: (table, column, sqlite_type, postgres_type)
 SCHEMA_COLUMNS = [
-    ("channel_scheduled_post", "media_path", "TEXT", "TEXT"),
     ("account_health", "tg_name", "VARCHAR(200)", "VARCHAR(200)"),
     ("account_health", "tg_username", "VARCHAR(100)", "VARCHAR(100)"),
     ("account_health", "spambot_released", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
@@ -9777,11 +9021,6 @@ SCHEMA_COLUMNS = [
     ("alert_settings", "email_enabled", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
     ("scheduled_broadcast", "repeat_interval", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
     ("scheduled_broadcast", "repeat_count", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
-    ("broadcast_task", "caption", "TEXT", "TEXT"),
-    ("broadcast_task", "repeat", "INTEGER DEFAULT 1", "INTEGER DEFAULT 1"),
-    ("broadcast_task", "rounds_done", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
-    ("broadcast_task", "next_round_at", "TIMESTAMP", "TIMESTAMP"),
-    ("broadcast_task", "task_key", "VARCHAR(64)", "VARCHAR(64)"),
     ("user", "is_banned", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
     ("user", "last_login_at", "TIMESTAMP", "TIMESTAMP"),
     ("auto_reply_bot", "provider", "VARCHAR(20) DEFAULT 'openai'", "VARCHAR(20) DEFAULT 'openai'"),
@@ -9800,7 +9039,6 @@ SCHEMA_COLUMNS = [
     ("auto_video_post_campaign", "last_round_summary", "TEXT", "TEXT"),
     ("auto_video_post_campaign", "worker_heartbeat", "TIMESTAMP", "TIMESTAMP"),
     ("auto_video_post_campaign", "vault_state", "TEXT", "TEXT"),
-    ("auto_video_post_campaign", "captions", "TEXT", "TEXT"),
 ]
 
 # Set by init_app_schema() so API routes can report a clear database error.
@@ -10019,32 +9257,35 @@ def resolve_secret_key():
 
 
 def ensure_default_admin():
-    """Create the admin account, honouring the ADMIN_PASSWORD environment variable."""
-    admin_password = os.environ.get('ADMIN_PASSWORD')
-    admin_user = User.query.filter_by(username='admin').first()
+    """Create (or refresh) the owner account on every boot.
+
+    Username and password are both **MRADS** by default, so a brand-new host or a
+    fresh database always has a login that is known before the first request.
+    ADMIN_USERNAME / ADMIN_PASSWORD override them; when ADMIN_PASSWORD is set it is
+    authoritative, which lets a redeploy reset a forgotten password.
+    """
+    admin_username = ADMIN_USERNAME
+    env_password = os.environ.get('ADMIN_PASSWORD')
+    admin_password = env_password or 'MRADS'
+    admin_user = User.query.filter_by(username=admin_username).first()
     if not admin_user:
-        if not admin_password:
-            admin_password = 'MRADS@TG2026!'
-            logger.warning(
-                'ADMIN_PASSWORD is not set: the admin account was created with the legacy '
-                'default password. Set ADMIN_PASSWORD in your environment and change it in '
-                'the Admin panel.'
-            )
-        db.session.add(User(username='admin', password=generate_password_hash(admin_password)))
+        db.session.add(User(username=admin_username,
+                            password=generate_password_hash(admin_password)))
         db.session.commit()
-        logger.info('Admin account created.')
+        logger.info('Admin account %s created.', admin_username)
         return 'created'
-    if admin_password and not check_password_hash(admin_user.password, admin_password):
-        # The environment variable is authoritative so a redeploy can reset the login.
+    if not check_password_hash(admin_user.password, admin_password):
         admin_user.password = generate_password_hash(admin_password)
         db.session.commit()
-        logger.info('Admin password synced from the ADMIN_PASSWORD environment variable.')
+        logger.info('Admin password for %s synced from configuration.', admin_username)
         return 'synced'
-    if check_password_hash(admin_user.password, 'admin123'):
-        admin_user.password = generate_password_hash(admin_password or 'MRADS@TG2026!')
-        db.session.commit()
-        logger.warning('Legacy admin password "admin123" upgraded — change it in the Admin panel.')
-        return 'upgraded'
+    if admin_username != 'admin':
+        # An older deployment still has the legacy "admin" account: keep it usable
+        # (same password) instead of stranding whoever is used to that login.
+        legacy = User.query.filter_by(username='admin').first()
+        if legacy and env_password and not check_password_hash(legacy.password, env_password):
+            legacy.password = generate_password_hash(env_password)
+            db.session.commit()
     return 'unchanged'
 
 
@@ -10147,9 +9388,6 @@ def start_background_jobs():
         logger.info('BACKGROUND_JOBS_ENABLED=0 — scheduled jobs are disabled.')
         return
     start_job_once('daily_reset', schedule_daily_reset)
-    # Runs the repeating rounds of every "Start Now" broadcast. Durable, so a
-    # redeploy no longer kills a campaign that is waiting between rounds.
-    start_job_once('broadcast_scheduler', run_broadcast_scheduler)
     start_job_once('scheduled_broadcasts', run_scheduled_broadcasts)
     start_job_once('health_monitor', schedule_health_monitor)
     start_job_once('channel_post_scheduler', run_channel_post_scheduler)
@@ -10171,5 +9409,6 @@ if __name__ == '__main__':
     port = _env_int('PORT', 5000, 1, 65535)
     print(f"\n🚀 Telegram Automation Dashboard running at http://0.0.0.0:{port}")
     print(f"🗄️  Database: {'PostgreSQL/Neon' if DB_IS_POSTGRES else 'SQLite (local fallback)'} via {DB_SOURCE}")
-    print("🔑 Login: admin / the ADMIN_PASSWORD you configured\n")
+    _shown = 'ADMIN_PASSWORD (from the environment)' if os.environ.get('ADMIN_PASSWORD') else 'MRADS'
+    print(f"🔑 Login: {ADMIN_USERNAME} / {_shown}\n")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
