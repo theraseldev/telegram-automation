@@ -160,9 +160,9 @@ async function register() {
         let data = null;
         try { data = await r.json(); } catch (e) { data = null; }
         if (data && data.success) {
-            showMsg('Account created. You can sign in now.', 'success-msg');
-            switchTab('login');
-            document.getElementById('loginUsername').value = username;
+            showMsg('Account created — opening your dashboard…', 'success-msg');
+            window.location.href = (data.redirect || '/dashboard');
+            return;
         } else {
             showMsg((data && data.error) || ('Registration failed (HTTP ' + r.status + ')'), 'error');
         }
