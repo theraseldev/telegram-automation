@@ -41,18 +41,37 @@ def normalize(url):
 
 
 def split_statements(sql):
-    """pg_dump style: a statement ends with a line that ends in ';'."""
-    statements, buf = [], ''
-    for line in sql.splitlines():
-        if not buf and (line.startswith('--') or not line.strip()):
+    """Split on ';' but respect single-quoted strings and ``--`` comments.
+
+    Captions in a real backup contain newlines, so splitting per line cuts a row in
+    half and Postgres then reports "unterminated quoted string". A character scanner
+    keeps those rows whole.
+    """
+    statements, buf, i, n = [], [], 0, len(sql)
+    in_str = False
+    while i < n:
+        ch = sql[i]
+        if not in_str and sql.startswith('--', i):
+            j = sql.find('\n', i)
+            i = n if j < 0 else j
             continue
-        buf += line + '\n'
-        if line.rstrip().endswith(';'):
-            statements.append(buf.strip())
-            buf = ''
-    if buf.strip():
-        statements.append(buf.strip())
-    return statements
+        if ch == "'":
+            if in_str and i + 1 < n and sql[i + 1] == "'":
+                buf.append("''")
+                i += 2
+                continue
+            in_str = not in_str
+            buf.append(ch)
+        elif ch == ';' and not in_str:
+            statements.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    tail = ''.join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return [s for s in statements if s]
 
 
 def main():
@@ -95,16 +114,38 @@ def main():
         cur.execute('CREATE SEQUENCE IF NOT EXISTS "%s"' % seq)
 
     executed = failed = 0
+    added_columns = []
     for stmt in split_statements(sql):
         if stmt.strip() in ('BEGIN;', 'COMMIT;'):
             continue
         try:
             cur.execute(stmt)
             executed += 1
+        except psycopg2.errors.UndefinedColumn as exc:
+            # A column the current models no longer declare (e.g. an old `caption`
+            # or `captions`). Add it as TEXT and retry instead of dropping the row.
+            match = re.search(r'column "([^"]+)" of relation "([^"]+)" does not exist', str(exc))
+            conn.rollback()
+            if not match:
+                failed += 1
+                print('  skip: %s' % str(exc).splitlines()[0][:120])
+                continue
+            column, table = match.groups()
+            try:
+                cur.execute('ALTER TABLE "%s" ADD COLUMN IF NOT EXISTS "%s" TEXT' % (table, column))
+                added_columns.append('%s.%s' % (table, column))
+                cur.execute(stmt)
+                executed += 1
+            except Exception as retry_exc:
+                failed += 1
+                print('  skip: %s -> %s' % (stmt.split('\n', 1)[0][:50],
+                                            str(retry_exc).splitlines()[0][:110]))
         except Exception as exc:
             failed += 1
             print('  skip: %s -> %s' % (stmt.split('\n', 1)[0][:60], str(exc).splitlines()[0][:120]))
 
+    if added_columns:
+        print('added legacy columns: %s' % ', '.join(sorted(set(added_columns))))
     print('executed %d statements, %d skipped' % (executed, failed))
 
     for table in ('user', 'telegram_account', 'activity_log', 'scheduled_task',
