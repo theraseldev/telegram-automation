@@ -171,6 +171,26 @@ def _resolve_database_uri():
 
 DB_URI, DB_SOURCE, DB_IS_POSTGRES = _resolve_database_uri()
 
+# Which managed platform (if any) this process runs on. Used to warn loudly when a
+# hosted deployment is about to store data on an ephemeral container filesystem.
+DB_HOST_PLATFORM = next(
+    (name for name, marker in (('railway', 'RAILWAY_ENVIRONMENT'),
+                               ('railway', 'RAILWAY_PROJECT_ID'),
+                               ('render', 'RENDER'),
+                               ('heroku', 'DYNO'),
+                               ('fly', 'FLY_APP_NAME'),
+                               ('cloud_run', 'K_SERVICE'),
+                               ('koyeb', 'KOYEB_APP_NAME'))
+     if os.environ.get(marker)),
+    '',
+)
+if DB_HOST_PLATFORM and not DB_IS_POSTGRES:
+    logger.warning(
+        'DATABASE_URL is not set on %s: data is being written to the container SQLite '
+        'file and WILL BE LOST on the next deploy. Set DATABASE_URL to a PostgreSQL URL.',
+        DB_HOST_PLATFORM,
+    )
+
 app.config['SECRET_KEY'] = (
     os.environ.get('SECRET_KEY')
     or os.environ.get('SESSION_SECRET')
@@ -323,6 +343,16 @@ def diagnostics():
             'psycopg2_installed': PSYCOPG_AVAILABLE,
             'connected': False,
             'init_error': DB_INIT_ERROR,
+            # True only for a real server database. SQLite inside a container is
+            # wiped by the next deploy, which is how accounts/sessions vanished
+            # before — so make it explicit instead of silent.
+            'persistent': DB_IS_POSTGRES,
+            'storage_warning': None if DB_IS_POSTGRES else (
+                'DATABASE_URL is not set: accounts, Telegram sessions and campaigns are '
+                'stored in a temporary SQLite file that is deleted on the next deploy '
+                'or restart. Set DATABASE_URL to a PostgreSQL/Neon connection string.'
+            ),
+            'host_platform': DB_HOST_PLATFORM,
         },
         'environment': {
             'SECRET_KEY_set': bool(secret),
