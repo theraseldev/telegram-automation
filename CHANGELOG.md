@@ -1,5 +1,49 @@
 # CHANGELOG.md — MR ADS TG AUTOMATION
 
+## [3.6.0] — 2026-11-15 — Campaign control centre (Pause / Resume / Stop / Delete / Duplicate)
+
+Reported: after starting a broadcast, bulk DM, DM campaign or a scheduled
+broadcast, the Messaging section showed **no Pause / Delete / Duplicate** — a
+running campaign could only be watched, never controlled.
+
+### Added — backend
+
+- `GET /bot/campaigns` returns **every** campaign (broadcast, DM campaign, bulk
+  DM, multi-account DM, running scheduled broadcast, and schedules that have not
+  fired yet) with status, sent/failed/skipped/total, percent, cursor, remaining,
+  age, owner (admin only) and the actions each one allows.
+- `POST /bot/campaigns/<key>/{pause,resume,stop}`, `DELETE /bot/campaigns/<key>`,
+  `POST /bot/campaigns/<key>/duplicate`.
+- `TaskRun` gained `label`, `payload`, `cursor`, `paused`, `stop_requested`
+  (auto-migrated on SQLite **and** PostgreSQL via `SCHEMA_COLUMNS`), so a paused
+  campaign survives a Railway restart. Resume re-runs from `cursor`, therefore a
+  target that was already messaged is never messaged twice.
+- Every messaging worker (broadcast, scheduled broadcast, bulk DM, DM campaign,
+  multi-account DM) checks the control flags **between targets** and writes the
+  cursor after each send.
+- `POST /bot/upload_media` + `GET /media/messaging/<name>`: the photo/video
+  upload used by 8 messaging forms answered 404 before, so attaching media
+  always failed.
+- Compatibility: `GET /bot/broadcast/campaigns`, `DELETE /bot/broadcast/campaigns/<id>`
+  and `POST /bot/task/<key>/stop` (the stop button already in the dashboard).
+
+### Added — UI
+
+- New sidebar page **🟢 Campaigns** (Messaging section) with a live count badge,
+  filter by campaign type, 5-second auto-refresh, progress bars, and
+  Pause / Resume / Stop / Duplicate / Delete buttons rendered only when they
+  apply. Duplicate and Delete ask for confirmation.
+- The Broadcast page card, the Pending Schedules list (Pause / Duplicate / ✕) and
+  the DM Campaign / Bulk DM pages all point at the same controls.
+
+### Verified
+
+`python -m pytest tests/test_suite.py -q` → **175 passed** (was 153 passed,
+1 failed on the missing-endpoint check). 21 new tests cover the list contract,
+pause-flag semantics, cursor-accurate resume, stop/delete/duplicate, schedule
+pause/resume/delete, ownership (403), media upload validation and the
+compatibility routes.
+
 ## [3.5.0] — 2026-10-09 — Auto Video Poster integrity + dead buttons
 
 Applied **on top of** the current `main` (which already carries the

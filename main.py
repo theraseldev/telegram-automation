@@ -1,4 +1,5 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, make_response
+from flask import (Flask, render_template, request, jsonify, redirect, url_for,
+                   make_response, send_from_directory)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -872,6 +873,14 @@ class TaskRun(db.Model):
     errors      = db.Column(db.Text, nullable=True)
     created_at  = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    # ── campaign control state (pause / resume / stop / duplicate) ───────────
+    # `payload` holds everything needed to restart the campaign from `cursor`,
+    # so Pause survives a Railway restart and Resume never re-sends a target.
+    label          = db.Column(db.String(160), nullable=True)   # "Broadcast · 12 groups · +8801…"
+    payload        = db.Column(db.Text, nullable=True)          # JSON: account, targets, content…
+    cursor         = db.Column(db.Integer, default=0)           # index of the next target to send
+    paused         = db.Column(db.Boolean, default=False)
+    stop_requested = db.Column(db.Boolean, default=False)
 
 
 class SavedTarget(db.Model):
@@ -1307,6 +1316,539 @@ def parse_post_url(url):
     if m:
         return m.group(1), int(m.group(2))
     return url, None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ─── CAMPAIGN CONTROL CENTRE ─────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Every long-running messaging job already writes a durable TaskRun row. This
+# block turns those rows into one control surface: a single list of every
+# campaign (broadcast, DM campaign, bulk DM, scheduled…) plus the actions a user
+# expects after pressing Start — Pause, Resume, Stop, Delete, Duplicate.
+#
+# Pause is durable: the worker stops BETWEEN two targets, saves `cursor`, and
+# the row says `paused`. Resume re-runs from `cursor`, so a target that was
+# already messaged is never messaged twice.
+
+CAMPAIGN_KIND_LABELS = {
+    'broadcast': 'Broadcast',
+    'scheduled_broadcast': 'Scheduled broadcast',
+    'dm_campaign': 'DM campaign',
+    'bulk_dm': 'Bulk DM',
+    'bulk_dm_multi': 'Multi-account DM',
+    'forwarder': 'Forwarder',
+    'schedule': 'Scheduled task',
+}
+CAMPAIGN_ACTIVE_STATUSES = ('running', 'queued', 'paused')
+# Kinds whose worker checkpoints a cursor, so Resume is exact and safe.
+CAMPAIGN_RESUMABLE_KINDS = ('broadcast', 'scheduled_broadcast', 'dm_campaign', 'bulk_dm')
+
+
+def campaign_kind_of(task_key):
+    """'broadcast:12' -> 'broadcast'; a bare uuid key has no prefix."""
+    key = str(task_key or '')
+    return key.split(':', 1)[0] if ':' in key else ''
+
+
+def campaign_label(kind, total, account_phone=None, extra=None):
+    parts = [CAMPAIGN_KIND_LABELS.get(kind, kind.replace('_', ' ').title() or 'Campaign')]
+    if total:
+        parts.append(f'{total} target' + ('' if total == 1 else 's'))
+    if account_phone:
+        parts.append(str(account_phone))
+    if extra:
+        parts.append(str(extra))
+    return ' · '.join(parts)[:155]
+
+
+def campaign_register(task_key, payload, label=None):
+    """Store everything needed to resume/duplicate this campaign."""
+    try:
+        payload = dict(payload or {})
+        payload.setdefault('label', label or '')
+        task_run_update(
+            task_key,
+            payload=json.dumps(payload, default=str),
+            label=(label or campaign_label(payload.get('kind'), len(payload.get('targets') or [])))[:155],
+            cursor=0,
+            paused=False,
+            stop_requested=False,
+        )
+    except Exception as e:
+        logger.debug('campaign_register(%s) failed: %s', task_key, e)
+    return payload
+
+
+def campaign_row(task_key):
+    try:
+        with app.app_context():
+            return TaskRun.query.filter_by(task_key=str(task_key)).first()
+    except Exception:
+        return None
+
+
+def campaign_payload(task_key):
+    row = campaign_row(task_key)
+    if row is None or not row.payload:
+        return None
+    try:
+        return json.loads(row.payload)
+    except Exception:
+        return None
+
+
+def campaign_control(task_key):
+    """Return 'stop', 'pause' or None — read fresh, once per target."""
+    row = campaign_row(task_key)
+    if row is not None:
+        if row.stop_requested:
+            return 'stop'
+        if row.paused:
+            return 'pause'
+    cache = task_progress.get(task_key) or {}
+    if cache.get('stop_requested'):
+        return 'stop'
+    if cache.get('paused'):
+        return 'pause'
+    return None
+
+
+def campaign_exit(task_key, reason, cursor):
+    """A worker leaves the loop on Pause/Stop: persist where it got to."""
+    status = 'stopped' if reason == 'stop' else 'paused'
+    task_progress.setdefault(task_key, {})['_aborted'] = reason
+    task_run_update(
+        task_key, status=status, cursor=safe_int(cursor, 0),
+        paused=(reason != 'stop'), stop_requested=(reason == 'stop'),
+    )
+    return status
+
+
+def campaign_was_aborted(task_key):
+    return (task_progress.get(task_key) or {}).get('_aborted')
+
+
+def campaign_counters(task_key):
+    """(sent, failed, skipped) already recorded — the base for a resume."""
+    row = campaign_row(task_key)
+    if row is None:
+        cache = task_progress.get(task_key) or {}
+        return (safe_int(cache.get('sent'), 0), safe_int(cache.get('failed'), 0),
+                safe_int(cache.get('skipped'), 0))
+    return (safe_int(row.sent, 0), safe_int(row.failed, 0), safe_int(row.skipped, 0))
+
+
+def campaign_worker(task_key, payload, start_index=0):
+    """Send payload['targets'] from `start_index`, honouring Pause/Stop.
+
+    Used by Resume and Duplicate. The original route keeps its own inline worker
+    for the first run; both write the same TaskRun row, counters and cursor, so
+    the two paths stay interchangeable.
+    """
+    payload = dict(payload or {})
+    kind = payload.get('kind') or campaign_kind_of(task_key) or 'campaign'
+    account_id = safe_int(payload.get('account_id'), 0)
+    targets = payload.get('targets') or []
+    delay = safe_int(payload.get('delay'), 3, minimum=1, maximum=MAX_DELAY_SECONDS)
+    message_type = clean_str(payload.get('message_type'), 'text') or 'text'
+    content = clean_str(payload.get('content'))
+    caption = clean_str(payload.get('caption'))
+    messages = [m for m in (payload.get('messages') or []) if clean_str(m)]
+    personalize = safe_bool(payload.get('personalize'), False)
+    tmap = payload.get('map') or 'groups'
+    start_index = max(0, safe_int(start_index, 0))
+
+    sent, failed, skipped = campaign_counters(task_key)
+
+    def _finish(status, **extra):
+        task_run_update(task_key, status=status, sent=sent, failed=failed,
+                        skipped=skipped, **extra)
+
+    try:
+        with app.app_context():
+            acc = TelegramAccount.query.get(account_id) if account_id else None
+            if acc is None or not acc.session_string:
+                _finish('failed', errors=['Account is missing or not connected'])
+                return
+            owner_id = acc.user_id
+            sess = acc.session_string
+            api_id, api_hash = get_api_credentials(owner_id)
+            proxy = get_proxy_for_account(owner_id, account_id)
+        if not api_id:
+            _finish('failed', errors=['Telegram API credentials not configured'])
+            return
+
+        with get_account_lock(account_id):
+            result = {'sent': 0, 'failed': 0, 'skipped': 0, 'errors': []}
+
+            async def _run():
+                nonlocal sent, failed, skipped
+                client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
+                await client.connect()
+                try:
+                    for i in range(start_index, len(targets)):
+                        gate = campaign_control(task_key)
+                        if gate:
+                            campaign_exit(task_key, gate, i)
+                            return gate
+                        tgt = targets[i]
+                        name = clean_str(tgt.get('username') if isinstance(tgt, dict) else tgt).lstrip('@')
+                        if tmap == 'groups':
+                            dest = await client.get_entity(safe_int(tgt, 0) or tgt)
+                            shown = str(tgt)
+                        else:
+                            dest = name
+                            shown = name or str(tgt)
+                        if not shown:
+                            skipped += 1
+                            task_run_update(task_key, skipped=skipped, cursor=i + 1)
+                            continue
+                        msg = messages[i % len(messages)] if (tmap == 'people' and messages) else content
+                        if personalize and isinstance(tgt, dict):
+                            first_name = clean_str(tgt.get('first_name'), 'there') or 'there'
+                            msg = msg.replace('{name}', first_name).replace('{first_name}', first_name)
+                        attempt = 0
+                        while True:
+                            try:
+                                if message_type == 'text':
+                                    await client.send_message(dest, msg)
+                                else:
+                                    await client.send_file(dest, content, caption=caption or None)
+                                sent += 1
+                                task_run_update(task_key, sent=sent, cursor=i + 1)
+                                await asyncio.sleep(delay)
+                                break
+                            except FloodWaitError as e:
+                                attempt += 1
+                                wait = min(safe_int(getattr(e, 'seconds', 0), 5), MAX_FLOOD_WAIT_SECONDS)
+                                await asyncio.sleep(wait)
+                                if attempt >= 2:
+                                    skipped += 1
+                                    note = f'{shown}: rate limit — skipped after waiting {wait}s'
+                                    result['errors'].append(note)
+                                    task_run_update(task_key, skipped=skipped, cursor=i + 1, errors=[note])
+                                    break
+                            except Exception as e:
+                                failed += 1
+                                note = friendly_telegram_error(e, shown)
+                                result['errors'].append(note)
+                                task_run_update(task_key, failed=failed, cursor=i + 1, errors=[note])
+                                break
+                finally:
+                    await client.disconnect()
+                return 'done'
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                outcome = loop.run_until_complete(_run())
+            finally:
+                loop.close()
+
+        if outcome in ('pause', 'stop'):
+            return                                   # status already written
+        if outcome != 'done':
+            _finish('failed', errors=['Campaign stopped unexpectedly'])
+            return
+        final_status = 'completed' if sent and not failed else ('failed' if not sent else 'partial')
+        _finish(final_status)
+        try:
+            with app.app_context():
+                acc = TelegramAccount.query.get(account_id)
+                if acc:
+                    delta = max(0, sent - safe_int(payload.get('_base_sent'), 0))
+                    acc.messages_sent_today += delta
+                    acc.total_messages += delta
+                    acc.last_used = datetime.utcnow()
+                    db.session.commit()
+        except Exception as e:
+            logger.debug('campaign %s counter update failed: %s', task_key, e)
+        log_activity(owner_id, f"{CAMPAIGN_KIND_LABELS.get(kind, kind)}: {sent} sent, {failed} failed "
+                               f"({'resumed run' if start_index else 'new run'})",
+                     'success' if sent else 'failed', account_id)
+    except Exception as e:
+        logger.error('campaign_worker(%s) crashed: %s', task_key, e)
+        try:
+            task_run_update(task_key, status='failed', errors=[friendly_telegram_error(e)])
+        except Exception:
+            pass
+
+
+def campaign_start_thread(task_key, payload, start_index=0):
+    threading.Thread(target=campaign_worker, args=(task_key, payload, start_index),
+                     daemon=True, name=f'campaign-{task_key[:18]}').start()
+
+
+def _campaign_age_seconds(row):
+    stamp = row.updated_at or row.created_at
+    if not stamp:
+        return None
+    return max(0, int((datetime.utcnow() - stamp).total_seconds()))
+
+
+def campaign_public(row, viewer_id, is_admin):
+    """One JSON-safe campaign object for the UI."""
+    kind = row.kind or campaign_kind_of(row.task_key) or 'campaign'
+    status = row.status or 'running'
+    if status == 'running' and row.paused:
+        status = 'paused'
+    total = safe_int(row.total, 0)
+    cursor = safe_int(row.cursor, 0)
+    sent = safe_int(row.sent, 0)
+    failed = safe_int(row.failed, 0)
+    skipped = safe_int(row.skipped, 0)
+    pct = int(min(100, round(sent * 100.0 / total))) if total else 0
+    return {
+        'task_key': row.task_key,
+        'kind': kind,
+        'kind_label': CAMPAIGN_KIND_LABELS.get(kind, kind.replace('_', ' ').title()),
+        'label': row.label or campaign_label(kind, total),
+        'status': status,
+        'sent': sent,
+        'failed': failed,
+        'skipped': skipped,
+        'total': total,
+        'cursor': cursor,
+        'remaining': max(0, total - cursor),
+        'percent': pct,
+        'errors': (row.errors or '').splitlines()[-5:],
+        'age_seconds': _campaign_age_seconds(row),
+        'owner_id': row.user_id,
+        'owner': (User.query.get(row.user_id).username if is_admin and row.user_id else None),
+        'can_pause': status == 'running' and kind in CAMPAIGN_RESUMABLE_KINDS,
+        'can_resume': status == 'paused' and kind in CAMPAIGN_RESUMABLE_KINDS,
+        'can_stop': status in ('running', 'paused'),
+        'can_delete': True,
+        'can_duplicate': bool(row.payload),
+    }
+
+
+def scheduled_campaign_public(sb, viewer_id, is_admin):
+    total = 0
+    try:
+        total = len(json.loads(sb.groups or '[]'))
+    except Exception:
+        total = 0
+    status = sb.status or 'pending'
+    return {
+        'task_key': f'sched:{sb.id}',
+        'kind': 'schedule',
+        'kind_label': 'Scheduled broadcast',
+        'label': f"Scheduled broadcast · {total} target{'s' if total != 1 else ''}",
+        'status': status,
+        'sent': safe_int(sb.sent_count, 0),
+        'failed': 0,
+        'skipped': 0,
+        'total': total,
+        'cursor': 0,
+        'remaining': total,
+        'percent': 0,
+        'scheduled_at': sb.scheduled_at.isoformat() if sb.scheduled_at else None,
+        'repeat_interval': safe_int(getattr(sb, 'repeat_interval', 0), 0),
+        'repeat_count': safe_int(getattr(sb, 'repeat_count', 0), 0),
+        'errors': [],
+        'age_seconds': None,
+        'owner_id': sb.user_id,
+        'owner': (User.query.get(sb.user_id).username if is_admin and sb.user_id else None),
+        'can_pause': status == 'pending',
+        'can_resume': status == 'paused',
+        'can_stop': False,
+        'can_delete': True,
+        'can_duplicate': True,
+    }
+
+
+def build_campaign_list(viewer_id, is_admin, kind_filter=None, limit=200):
+    """Every campaign of this user (admin: everybody), newest activity first."""
+    if is_admin:
+        rows = TaskRun.query.order_by(TaskRun.updated_at.desc()).limit(limit).all()
+    else:
+        rows = (TaskRun.query.filter_by(user_id=viewer_id)
+                .order_by(TaskRun.updated_at.desc()).limit(limit).all())
+    items = []
+    keys = set()
+    for row in rows:
+        keys.add(row.task_key)
+        item = campaign_public(row, viewer_id, is_admin)
+        if kind_filter and item['kind'] != kind_filter:
+            continue
+        items.append(item)
+
+    # Schedules that have not fired yet have no TaskRun row — list them anyway,
+    # otherwise a scheduled campaign looks like it vanished until it starts.
+    try:
+        q = ScheduledBroadcast.query.filter(ScheduledBroadcast.status.in_(('pending', 'paused')))
+        if not is_admin:
+            q = q.filter_by(user_id=viewer_id)
+        for sb in q.order_by(ScheduledBroadcast.scheduled_at.asc()).limit(limit).all():
+            if f'sched:{sb.id}' in keys:
+                continue
+            item = scheduled_campaign_public(sb, viewer_id, is_admin)
+            if kind_filter and item['kind'] != kind_filter:
+                continue
+            items.append(item)
+    except Exception as e:
+        logger.debug('scheduled campaign merge failed: %s', e)
+
+    def _sort_key(item):
+        stamp = item.get('scheduled_at')
+        if item['status'] in CAMPAIGN_ACTIVE_STATUSES:
+            return (0, item['age_seconds'] or 0)
+        return (1, 0 if not stamp else -1)
+
+    items.sort(key=_sort_key)
+    counts = {
+        'running': sum(1 for i in items if i['status'] == 'running'),
+        'paused': sum(1 for i in items if i['status'] == 'paused'),
+        'queued': sum(1 for i in items if i['status'] in ('pending', 'queued')),
+        'total': len(items),
+    }
+    return items, counts
+
+
+def campaign_owned_row(task_key):
+    """Find the TaskRun row for a key, enforcing ownership. (row, error, code)"""
+    row = campaign_row(task_key)
+    if row is None:
+        return None, None, None
+    if row.user_id != current_user.id and current_user.username not in ADMIN_USERS:
+        return None, 'Not your campaign', 403
+    return row, None, None
+
+
+def campaign_pause(task_key):
+    row, error, code = campaign_owned_row(task_key)
+    if error:
+        return error, code
+    if row is None:
+        return 'Campaign not found', 404
+    if row.status not in ('running', 'queued'):
+        return f'This campaign is {row.status} — nothing to pause', 409
+    task_run_update(task_key, paused=True, status=row.status)
+    return None, None
+
+
+def campaign_resume(task_key):
+    row, error, code = campaign_owned_row(task_key)
+    if error:
+        return error, code
+    if row is None:
+        return 'Campaign not found', 404
+    if row.status not in ('paused', 'stopped'):
+        return f'This campaign is {row.status} — nothing to resume', 409
+    payload = campaign_payload(task_key)
+    if not payload:
+        return 'This campaign has no saved settings to resume from. Start it again instead.', 409
+    targets = payload.get('targets') or []
+    cursor = safe_int(row.cursor, 0)
+    if cursor >= len(targets):
+        return 'Nothing left to send in this campaign', 409
+    if account_busy(safe_int(payload.get('account_id'), 0)):
+        return 'That account is busy with another campaign right now', 409
+    payload['_base_sent'] = safe_int(row.sent, 0)
+    task_progress.pop(task_key, None)
+    task_run_update(task_key, status='running', paused=False, stop_requested=False,
+                    total=len(targets), cursor=cursor, errors=None)
+    campaign_start_thread(task_key, payload, cursor)
+    return None, None
+
+
+def campaign_stop(task_key):
+    row, error, code = campaign_owned_row(task_key)
+    if error:
+        return error, code
+    if row is None:
+        return 'Campaign not found', 404
+    if row.status in ('completed', 'failed', 'partial'):
+        return f'This campaign already finished ({row.status})', 409
+    task_run_update(task_key, stop_requested=True, paused=False)
+    cache = task_progress.setdefault(task_key, {})
+    cache['stop_requested'] = True
+    if row.status in ('queued', 'paused') or row.task_key.startswith('sched:'):
+        # Nothing is in flight — mark it stopped straight away.
+        task_run_update(task_key, status='stopped', paused=False)
+    return None, None
+
+
+def campaign_delete(task_key):
+    row, error, code = campaign_owned_row(task_key)
+    if error:
+        return error, code
+    kind = campaign_kind_of(task_key) or (row.kind if row else '')
+    source_id = task_key.split(':', 1)[1] if ':' in task_key else None
+    if row is None and kind != 'sched':
+        return 'Campaign not found', 404
+    if row is not None and row.status in ('running',):
+        task_run_update(task_key, stop_requested=True, status='stopped', paused=False)
+    try:
+        with app.app_context():
+            if kind == 'broadcast' and source_id:
+                obj = BroadcastTask.query.get(safe_int(source_id, 0))
+                if obj:
+                    db.session.delete(obj)
+            if kind == 'sched' and source_id:
+                obj = ScheduledBroadcast.query.get(safe_int(source_id, 0))
+                if obj:
+                    db.session.delete(obj)
+            row = TaskRun.query.filter_by(task_key=task_key).first()
+            if row is not None:
+                db.session.delete(row)
+            db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return f'Could not delete: {e}', 500
+    task_progress.pop(task_key, None)
+    return None, None
+
+
+def campaign_duplicate(task_key):
+    """Copy a campaign's settings and targets into a brand-new run."""
+    row, error, code = campaign_owned_row(task_key)
+    if error:
+        return None, error, code
+    kind = campaign_kind_of(task_key)
+    if row is None and kind == 'sched':
+        # A pending schedule: copy the schedule instead of starting it now.
+        try:
+            with app.app_context():
+                sb = ScheduledBroadcast.query.get(safe_int(task_key.split(':', 1)[1], 0))
+                if sb is None:
+                    return None, 'Campaign not found', 404
+                if sb.user_id != current_user.id and current_user.username not in ADMIN_USERS:
+                    return None, 'Not your campaign', 403
+                copy = ScheduledBroadcast(
+                    user_id=sb.user_id, account_id=sb.account_id,
+                    message_type=sb.message_type, content=sb.content, caption=sb.caption,
+                    groups=sb.groups, delay=sb.delay,
+                    scheduled_at=max(sb.scheduled_at, datetime.utcnow() + timedelta(minutes=5)),
+                    status='pending', repeat_interval=sb.repeat_interval,
+                    repeat_count=sb.repeat_count,
+                )
+                db.session.add(copy)
+                db.session.commit()
+                return f'sched:{copy.id}', f'Schedule copied as #{copy.id}', None
+        except Exception as e:
+            db.session.rollback()
+            return None, f'Could not duplicate: {e}', 500
+    if row is None:
+        return None, 'Campaign not found', 404
+    payload = campaign_payload(task_key)
+    if not payload:
+        return None, 'This campaign has no saved settings to duplicate', 409
+    account_id = safe_int(payload.get('account_id'), 0)
+    if not get_account_for_current_user(account_id):
+        return None, 'The account used by this campaign is no longer available', 409
+    if account_busy(account_id):
+        return None, 'That account is busy with another campaign right now', 409
+    new_key = uuid.uuid4().hex
+    payload = dict(payload)
+    payload['_base_sent'] = 0
+    label = f"Copy of {row.label or campaign_label(payload.get('kind'), len(payload.get('targets') or []))}"
+    task_run_start(row.user_id, payload.get('kind') or row.kind, len(payload.get('targets') or []),
+                   task_key=new_key)
+    campaign_register(new_key, payload, label=label)
+    campaign_start_thread(new_key, payload, 0)
+    return new_key, 'Duplicated — the copy is running now', None
 
 
 # ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
@@ -3243,6 +3785,11 @@ def broadcast():
         db.session.commit()
         task_id = task.id
         task_key = task_run_start(current_user.id, 'broadcast', len(group_ids), task_key=f'broadcast:{task_id}')
+        campaign_register(task_key, {
+            'kind': 'broadcast', 'account_id': account_id, 'map': 'groups',
+            'targets': group_ids, 'message_type': message_type, 'content': content,
+            'caption': caption or '', 'delay': delay, 'source_id': task_id,
+        }, label=campaign_label('broadcast', len(group_ids), account.phone))
         user_id = current_user.id
         sess = account.session_string
         lock = get_account_lock(account_id)
@@ -3257,7 +3804,12 @@ def broadcast():
                         client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                         await client.connect()
                         try:
-                            for group_id in group_ids:
+                            for index, group_id in enumerate(group_ids):
+                                gate = campaign_control(task_key)
+                                if gate:
+                                    campaign_exit(task_key, gate, index)
+                                    result['aborted'] = gate
+                                    return result
                                 try:
                                     entity = await client.get_entity(safe_int(group_id, 0) or group_id)
                                     if message_type in ('photo', 'video'):
@@ -3265,7 +3817,7 @@ def broadcast():
                                     else:
                                         await client.send_message(entity, content)
                                     result['sent'] += 1
-                                    task_run_update(task_key, sent=result['sent'])
+                                    task_run_update(task_key, sent=result['sent'], cursor=index + 1)
                                     await asyncio.sleep(delay)
                                 except FloodWaitError as e:
                                     # Honour Telegram's wait — never bypass the rate limit.
@@ -3291,6 +3843,15 @@ def broadcast():
                             result = loop.run_until_complete(_broadcast())
                         finally:
                             loop.close()
+                        if result.get('aborted'):
+                            # Paused/stopped: the TaskRun row already says so and
+                            # keeps the cursor — do not overwrite it as finished.
+                            t = BroadcastTask.query.get(task_id)
+                            if t:
+                                t.status = 'stopped' if result['aborted'] == 'stop' else 'paused'
+                                t.sent_count = result['sent']
+                                db.session.commit()
+                            return
                         # A run with zero confirmed sends is NOT a success.
                         final_status = 'completed' if result['sent'] and not result['failed'] else (
                             'failed' if not result['sent'] else 'partial'
@@ -3880,6 +4441,11 @@ def send_dm():
         user_id = current_user.id
         sess = account.session_string
         task_key = task_run_start(user_id, 'bulk_dm', len(usernames))
+        campaign_register(task_key, {
+            'kind': 'bulk_dm', 'account_id': account_id, 'map': 'usernames',
+            'targets': usernames, 'message_type': 'text', 'content': message,
+            'caption': '', 'delay': delay,
+        }, label=campaign_label('bulk_dm', len(usernames), account.phone))
         lock = get_account_lock(account_id)
 
         def run_dm():
@@ -3892,13 +4458,18 @@ def send_dm():
                         client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                         await client.connect()
                         try:
-                            for uname in usernames:
+                            for index, uname in enumerate(usernames):
+                                gate = campaign_control(task_key)
+                                if gate:
+                                    campaign_exit(task_key, gate, index)
+                                    result['aborted'] = gate
+                                    return result
                                 attempt = 0
                                 while True:
                                     try:
                                         await client.send_message(uname, message)
                                         result['sent'] += 1
-                                        task_run_update(task_key, sent=result['sent'])
+                                        task_run_update(task_key, sent=result['sent'], cursor=index + 1)
                                         await asyncio.sleep(delay)
                                         break
                                     except FloodWaitError as e:
@@ -3928,6 +4499,8 @@ def send_dm():
                             result = loop.run_until_complete(_dm())
                         finally:
                             loop.close()
+                        if result.get('aborted'):
+                            return          # paused/stopped: cursor + status already saved
                         final_status = 'completed' if result['sent'] and not result['failed'] else (
                             'failed' if not result['sent'] else 'partial'
                         )
@@ -4018,6 +4591,11 @@ def send_dm_multi():
                         await client.connect()
                         try:
                             for uname in names:
+                                gate = campaign_control(task_key)
+                                if gate:
+                                    if gate == 'stop':
+                                        task_progress.setdefault(task_key, {})['stop_requested'] = True
+                                    return result
                                 attempt = 0
                                 while True:
                                     try:
@@ -4080,6 +4658,10 @@ def send_dm_multi():
             snapshot = task_run_snapshot(task_key) or {}
             sent = safe_int(snapshot.get('sent'), 0)
             failed = safe_int(snapshot.get('failed'), 0)
+            _row = campaign_row(task_key)
+            if (task_progress.get(task_key) or {}).get('stop_requested') or (_row and _row.stop_requested):
+                task_run_finish(task_key, 'stopped')
+                return
             final_status = 'completed' if sent and not failed else ('failed' if not sent else 'partial')
             task_run_finish(task_key, final_status)
             log_activity(
@@ -4142,6 +4724,12 @@ def dm_campaign():
 
         task_id = uuid.uuid4().hex
         task_run_start(current_user.id, 'dm_campaign', len(targets), task_key=task_id)
+        campaign_register(task_id, {
+            'kind': 'dm_campaign', 'account_id': account_id, 'map': 'people',
+            'targets': targets, 'message_type': 'text', 'content': messages[0],
+            'caption': '', 'delay': delay, 'messages': messages,
+            'personalize': personalize,
+        }, label=campaign_label('dm_campaign', len(targets), account.phone))
         user_id = current_user.id
         sess = account.session_string
         lock = get_account_lock(account_id)
@@ -4157,6 +4745,11 @@ def dm_campaign():
                         await client.connect()
                         try:
                             for i, target in enumerate(targets):
+                                gate = campaign_control(task_id)
+                                if gate:
+                                    campaign_exit(task_id, gate, i)
+                                    result['aborted'] = gate
+                                    return result
                                 username = clean_str(
                                     target.get('username') if isinstance(target, dict) else target
                                 ).lstrip('@')
@@ -4202,6 +4795,8 @@ def dm_campaign():
                             result = loop.run_until_complete(_campaign())
                         finally:
                             loop.close()
+                        if result.get('aborted'):
+                            return          # paused/stopped: cursor + status already saved
                         final_status = 'completed' if result['sent'] and not result['failed'] else (
                             'failed' if not result['sent'] else 'partial'
                         )
@@ -4239,6 +4834,221 @@ def campaign_status(task_id):
     if not progress:
         return jsonify({'success': False, 'error': 'Task not found (it may have finished before the last restart)'})
     return jsonify({'success': True, 'progress': progress})
+
+
+# ─── CAMPAIGN API: one list, one set of controls ─────────────────────────────
+
+@app.route('/bot/campaigns')
+@login_required
+def bot_campaigns():
+    """Every campaign the user owns, with the actions each one allows."""
+    try:
+        kind = clean_str(request.args.get('kind')) or None
+        is_admin = current_user.username in ADMIN_USERS
+        items, counts = build_campaign_list(current_user.id, is_admin, kind_filter=kind)
+        return jsonify({'success': True, 'campaigns': items, 'counts': counts})
+    except Exception as e:
+        logger.exception('bot_campaigns error')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/bot/campaigns/<path:task_key>/pause', methods=['POST'])
+@login_required
+def bot_campaign_pause(task_key):
+    if campaign_kind_of(task_key) == 'sched':
+        try:
+            with app.app_context():
+                sb = ScheduledBroadcast.query.get(safe_int(task_key.split(':', 1)[1], 0))
+                if sb is None:
+                    return jsonify({'success': False, 'error': 'Campaign not found'}), 404
+                if sb.user_id != current_user.id and current_user.username not in ADMIN_USERS:
+                    return jsonify({'success': False, 'error': 'Not your campaign'}), 403
+                if sb.status != 'pending':
+                    return jsonify({'success': False,
+                                    'error': f'This schedule is {sb.status} — nothing to pause'}), 409
+                sb.status = 'paused'
+                db.session.commit()
+            return jsonify({'success': True, 'message': 'Schedule paused — it will not fire until you resume it'})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+    error, code = campaign_pause(task_key)
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Pausing after the message in flight'})
+
+
+@app.route('/bot/campaigns/<path:task_key>/resume', methods=['POST'])
+@login_required
+def bot_campaign_resume(task_key):
+    if campaign_kind_of(task_key) == 'sched':
+        try:
+            with app.app_context():
+                sb = ScheduledBroadcast.query.get(safe_int(task_key.split(':', 1)[1], 0))
+                if sb is None:
+                    return jsonify({'success': False, 'error': 'Campaign not found'}), 404
+                if sb.user_id != current_user.id and current_user.username not in ADMIN_USERS:
+                    return jsonify({'success': False, 'error': 'Not your campaign'}), 403
+                if sb.status != 'paused':
+                    return jsonify({'success': False,
+                                    'error': f'This schedule is {sb.status} — nothing to resume'}), 409
+                sb.status = 'pending'
+                if sb.scheduled_at and sb.scheduled_at <= datetime.utcnow():
+                    sb.scheduled_at = datetime.utcnow() + timedelta(minutes=1)
+                db.session.commit()
+            return jsonify({'success': True, 'message': 'Schedule resumed'})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+    error, code = campaign_resume(task_key)
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Resumed from the next unsent target'})
+
+
+@app.route('/bot/campaigns/<path:task_key>/stop', methods=['POST'])
+@login_required
+def bot_campaign_stop(task_key):
+    error, code = campaign_stop(task_key)
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Stop requested — the campaign is stopping'})
+
+
+@app.route('/bot/campaigns/<path:task_key>', methods=['DELETE'])
+@login_required
+def bot_campaign_delete(task_key):
+    error, code = campaign_delete(task_key)
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Campaign removed'})
+
+
+@app.route('/bot/campaigns/<path:task_key>/duplicate', methods=['POST'])
+@login_required
+def bot_campaign_duplicate(task_key):
+    new_key, message, code = campaign_duplicate(task_key)
+    if code:
+        return jsonify({'success': False, 'error': message}), code
+    return jsonify({'success': True, 'task_key': new_key, 'message': message})
+
+
+@app.route('/bot/task/<path:task_key>/stop', methods=['POST'])
+@login_required
+def bot_task_stop(task_key):
+    """Used by the per-tool Stop buttons already in the dashboard."""
+    error, code = campaign_stop(task_key)
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Stop requested'})
+
+
+@app.route('/bot/broadcast/campaigns')
+@login_required
+def broadcast_campaigns():
+    """Broadcast-only view (the Broadcast page card uses this)."""
+    try:
+        is_admin = current_user.username in ADMIN_USERS
+        items, _ = build_campaign_list(current_user.id, is_admin, kind_filter='broadcast')
+        out = []
+        for item in items:
+            source_id = safe_int(str(item['task_key']).split(':', 1)[-1], 0)
+            out.append({
+                'id': source_id,
+                'task_key': item['task_key'],
+                'status': item['status'],
+                'sent': item['sent'],
+                'failed': item['failed'],
+                'skipped': item['skipped'],
+                'total': item['total'],
+                'errors': item['errors'],
+                'age_seconds': item['age_seconds'],
+                'label': item['label'],
+                'percent': item['percent'],
+                'can_pause': item['can_pause'],
+                'can_resume': item['can_resume'],
+                'can_stop': item['can_stop'],
+                'can_duplicate': item['can_duplicate'],
+                'can_delete': True,
+            })
+        return jsonify({'success': True, 'campaigns': out})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/bot/broadcast/campaigns/<int:campaign_id>', methods=['DELETE'])
+@login_required
+def broadcast_campaign_delete(campaign_id):
+    error, code = campaign_delete(f'broadcast:{campaign_id}')
+    if error:
+        return jsonify({'success': False, 'error': error}), code
+    return jsonify({'success': True, 'message': 'Campaign removed'})
+
+
+# ─── MEDIA UPLOAD (attach photos/videos to messaging tools) ──────────────────
+
+MESSAGING_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+MESSAGING_VIDEO_EXT = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v'}
+
+
+def messaging_media_root():
+    root = os.path.join(AUTO_VIDEO_ROOT, 'messaging')
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+@app.route('/bot/upload_media', methods=['POST'])
+@login_required
+def upload_media():
+    """Store a photo/video chosen in a messaging form and return its path.
+
+    The path is what the tools send (Telethon accepts a local file path), the
+    URL is only the preview shown in the browser.
+    """
+    try:
+        upload = request.files.get('file') or request.files.get('media')
+        if upload is None or not upload.filename:
+            return jsonify({'success': False, 'error': 'No file received'}), 400
+        original = os.path.basename(upload.filename)
+        ext = os.path.splitext(original)[1].lower()
+        if ext in MESSAGING_IMAGE_EXT:
+            kind = 'photo'
+        elif ext in MESSAGING_VIDEO_EXT:
+            kind = 'video'
+        else:
+            return jsonify({'success': False,
+                            'error': f'Unsupported file type "{ext or original}". '
+                                     'Use an image (jpg/png/webp/gif) or a video (mp4/mkv/mov/webm/avi/m4v).'}), 400
+        safe_stem = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.splitext(original)[0])[:40] or 'media'
+        filename = f'{safe_stem}-{uuid.uuid4().hex[:10]}{ext}'
+        root = messaging_media_root()
+        target = os.path.join(root, filename)
+        upload.save(target)
+        size = os.path.getsize(target)
+        if size == 0:
+            os.remove(target)
+            return jsonify({'success': False, 'error': 'That file is empty'}), 400
+        root_is_volume = os.path.abspath(root).startswith(os.path.abspath(os.sep + 'data'))
+        return jsonify({
+            'success': True,
+            'file': {
+                'path': target,
+                'url': url_for('messaging_media', filename=filename),
+                'kind': kind,
+                'original_name': original,
+                'size': size,
+                'persistent': bool(root_is_volume),
+            },
+        })
+    except Exception as e:
+        logger.exception('upload_media error')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/media/messaging/<path:filename>')
+@login_required
+def messaging_media(filename):
+    return send_from_directory(messaging_media_root(), filename)
 
 
 # ─── SUBSCRIPTION ────────────────────────────────────────────────────────────
@@ -4817,6 +5627,12 @@ def run_scheduled_broadcasts():
                         repeat_count    = safe_int(getattr(sb, 'repeat_count', 0), 0, minimum=0)
                         task_key = f'sched:{sb_id}'
                         task_run_start(user_id, 'scheduled_broadcast', len(group_ids), task_key=task_key)
+                        campaign_register(task_key, {
+                            'kind': 'scheduled_broadcast', 'account_id': account_id, 'map': 'groups',
+                            'targets': group_ids, 'message_type': message_type,
+                            'content': content, 'caption': caption or '', 'delay': delay,
+                            'source_id': sb_id,
+                        }, label=campaign_label('scheduled_broadcast', len(group_ids), acc.phone))
 
                         def run_sb(sb_id=sb_id, account_id=account_id, user_id=user_id,
                                    group_ids=group_ids, content=content, caption=caption,
@@ -4831,7 +5647,12 @@ def run_scheduled_broadcasts():
                                     client = TelegramClient(StringSession(sess), api_id, api_hash, proxy=proxy)
                                     await client.connect()
                                     try:
-                                        for gid in group_ids:
+                                        for index, gid in enumerate(group_ids):
+                                            gate = campaign_control(task_key)
+                                            if gate:
+                                                campaign_exit(task_key, gate, index)
+                                                result['aborted'] = gate
+                                                return result
                                             attempt = 0
                                             while True:
                                                 try:
@@ -4841,7 +5662,7 @@ def run_scheduled_broadcasts():
                                                     else:
                                                         await client.send_file(entity, content, caption=caption or content)
                                                     result['sent'] += 1
-                                                    task_run_update(task_key, sent=result['sent'])
+                                                    task_run_update(task_key, sent=result['sent'], cursor=index + 1)
                                                     await asyncio.sleep(delay)
                                                     break
                                                 except FloodWaitError as e:
@@ -4868,6 +5689,15 @@ def run_scheduled_broadcasts():
                                 asyncio.set_event_loop(loop)
                                 try:
                                     result = loop.run_until_complete(_sb())
+                                    if result.get('aborted'):
+                                        # Paused/stopped mid-run: keep cursor, do not
+                                        # mark the schedule finished.
+                                        s_abort = ScheduledBroadcast.query.get(sb_id)
+                                        if s_abort:
+                                            s_abort.status = 'paused' if result['aborted'] == 'pause' else 'stopped'
+                                            s_abort.sent_count = result['sent']
+                                            db.session.commit()
+                                        return
                                     # zero confirmed sends is never reported as success
                                     final_status = 'completed' if result['sent'] and not result['failed'] else (
                                         'failed' if not result['sent'] else 'partial'
@@ -9069,6 +9899,13 @@ SCHEMA_COLUMNS = [
     ("auto_video_post_campaign", "last_round_summary", "TEXT", "TEXT"),
     ("auto_video_post_campaign", "worker_heartbeat", "TIMESTAMP", "TIMESTAMP"),
     ("auto_video_post_campaign", "vault_state", "TEXT", "TEXT"),
+    # Campaign control centre: pause/resume state and the payload needed to
+    # restart a campaign exactly where it stopped.
+    ("task_run", "label", "VARCHAR(160)", "VARCHAR(160)"),
+    ("task_run", "payload", "TEXT", "TEXT"),
+    ("task_run", "cursor", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+    ("task_run", "paused", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
+    ("task_run", "stop_requested", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Set by init_app_schema() so API routes can report a clear database error.

@@ -330,6 +330,7 @@ input[type=file].form-control{padding:9px}
   <div class="nav-item" data-page="accounts">👤 Accounts</div>
   <div class="nav-item" data-page="join-requests">👥 Join Requests</div>
   <div class="nav-section">Messaging</div>
+  <div class="nav-item" data-page="campaigns">🟢 Campaigns <span id="campaignNavBadge" style="display:none;background:#1f6feb;color:#fff;border-radius:9px;padding:0 6px;font-size:10px;margin-left:4px"></span></div>
   <div class="nav-item" data-page="broadcast">📢 Broadcast</div>
   <div class="nav-item" data-page="schedule">🕐 Scheduled</div>
   <div class="nav-item" data-page="personal">💬 Personal Chats</div>
@@ -589,6 +590,35 @@ input[type=file].form-control{padding:9px}
 </div>
 
 <!-- BROADCAST -->
+<!-- CAMPAIGNS — every run in one place, with Pause / Resume / Stop / Delete / Duplicate -->
+<div class="page" id="page-campaigns">
+  <div class="page-title">🟢 Campaigns</div>
+  <div class="alert" id="campaignsAlert"></div>
+  <div class="card" style="margin-bottom:14px">
+    <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+      <span id="campaignCounts" style="font-size:12px;color:#8b949e">Loading…</span>
+      <select class="form-control" id="campaignKindFilter" style="max-width:215px;margin-left:auto" onchange="loadCampaigns(true)">
+        <option value="">All campaign types</option>
+        <option value="broadcast">📢 Broadcast</option>
+        <option value="scheduled_broadcast">🕐 Scheduled broadcast (running)</option>
+        <option value="schedule">📅 Scheduled (waiting)</option>
+        <option value="dm_campaign">🎯 DM campaign</option>
+        <option value="bulk_dm">📨 Bulk DM</option>
+        <option value="bulk_dm_multi">📨 Multi-account DM</option>
+      </select>
+      <label style="font-size:12px;color:#8b949e;cursor:pointer;display:flex;align-items:center;gap:5px">
+        <input type="checkbox" id="campaignAutoRefresh" checked> auto-refresh
+      </label>
+      <button class="btn btn-sm btn-gray" type="button" onclick="loadCampaigns(true)">🔄 Refresh</button>
+    </div>
+    <div style="font-size:11.5px;color:#6c7d9c;margin-top:8px">
+      Pause stops the campaign <b>before the next target</b> and remembers exactly where it stopped, so Resume never messages the same person twice.
+      Delete also stops a running campaign first. Duplicate copies the targets + content into a new run.
+    </div>
+  </div>
+  <div id="campaignsList"><p style="color:#8b949e;padding:14px">Loading campaigns…</p></div>
+</div>
+
 <div class="page" id="page-broadcast">
   <div class="page-title">📢 Group Broadcast</div>
   <!-- Broadcast campaign list: which runs exist, how far they got, and stop/remove.
@@ -803,6 +833,10 @@ input[type=file].form-control{padding:9px}
 <div class="page" id="page-dms">
   <div class="page-title">📨 Bulk Direct Messages</div>
   <div class="alert" id="dmAlert"></div>
+  <div class="card" style="padding:9px 12px;margin-bottom:10px;font-size:12px;color:#8b949e;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span>Running a bulk DM? Pause, resume, duplicate or delete it from the Campaigns page.</span>
+    <button class="btn btn-sm btn-gray" type="button" onclick="jumpToPage('campaigns')">🟢 Open Campaigns</button>
+  </div>
   <div class="two-col">
     <div>
       <div class="card">
@@ -864,6 +898,10 @@ input[type=file].form-control{padding:9px}
 <div class="page" id="page-campaign">
   <div class="page-title">🎯 DM Campaigns</div>
   <div class="alert" id="campaignAlert"></div>
+  <div class="card" style="padding:9px 12px;margin-bottom:10px;font-size:12px;color:#8b949e;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span>Pause, resume or copy a running DM campaign from the Campaigns page.</span>
+    <button class="btn btn-sm btn-gray" type="button" onclick="jumpToPage('campaigns')">🟢 Open Campaigns</button>
+  </div>
   <div class="two-col">
     <div>
       <div class="card">
@@ -2213,7 +2251,8 @@ document.querySelectorAll('.nav-item').forEach(el => {
 });
 
 function onPageLoad(page) {
-  if (page === 'dashboard') loadDashboard();
+  if (page === 'campaigns') loadCampaigns(true);
+  else if (page === 'dashboard') loadDashboard();
   else if (page === 'accounts') { checkCredentials(); loadAccounts(); loadProxy(); populateProxyAccountSelector(); loadAlertSettings(); }
   else if (['broadcast','schedule','personal','dms','campaign','autojoin','groupsearch','grplinks','scraper','addmembers','report','actools'].includes(page)) {
     populateAccountSelects();
@@ -2223,6 +2262,13 @@ function onPageLoad(page) {
     if (page === 'addmembers') loadAddMembersAccounts();
     if (page === 'actools') populateToolsAccounts();
   }
+}
+
+// Jump to another dashboard page from a button inside a card.
+function jumpToPage(page) {
+  const nav = document.querySelector('.nav-item[data-page="' + page + '"]');
+  if (nav) { nav.click(); return; }
+  if (typeof showPage === 'function') showPage(page);
 }
 
 function showAlert(id, msg, type='success') {
@@ -2815,9 +2861,14 @@ async function loadScheduled() {
         <div style="font-size:12px">
           <div><strong>${s.account}</strong> → ${s.groups_count} groups</div>
           <div style="color:#8b949e">${s.content} | ${new Date(s.scheduled_at).toLocaleString()}</div>
-          <span class="badge ${s.status==='pending'?'badge-orange':s.status==='completed'?'badge-green':'badge-red'}">${s.status}</span>
+          <span class="badge ${(s.status==='pending'||s.status==='paused'||s.status==='running')?'badge-orange':s.status==='completed'?'badge-green':'badge-red'}">${s.status}</span>
         </div>
-        ${s.status==='pending'?`<button class="btn btn-sm btn-danger" onclick="deleteScheduled(${s.id})">✕</button>`:''}
+        <div class="row" style="gap:6px;flex-wrap:wrap">
+          ${s.status==='pending'?`<button class="btn btn-sm btn-gray" title="Hold this schedule — it will not fire until you resume" onclick="campaignAction('sched:${s.id}','pause')">⏸ Pause</button>`:''}
+          ${s.status==='paused'?`<button class="btn btn-sm btn-gray" onclick="campaignAction('sched:${s.id}','resume')">▶ Resume</button>`:''}
+          ${(s.status==='pending'||s.status==='paused')?`<button class="btn btn-sm btn-gray" onclick="campaignAction('sched:${s.id}','duplicate')">📄 Duplicate</button>`:''}
+          ${(s.status==='pending'||s.status==='paused')?`<button class="btn btn-sm btn-danger" onclick="deleteScheduled(${s.id})">✕</button>`:''}
+        </div>
       </div>`).join('');
   } else {
     list.innerHTML = '<p style="color:#8b949e;text-align:center;padding:12px;font-size:12px">No scheduled broadcasts</p>';
@@ -4157,6 +4208,7 @@ function installDelayHelpers() {
 function _bootHelpers() {
   installDelayHelpers();
   if (typeof loadBroadcastCampaigns === 'function') loadBroadcastCampaigns();
+  if (typeof refreshCampaignBadge === 'function') refreshCampaignBadge();
 }
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', _bootHelpers);
@@ -4164,9 +4216,165 @@ if (document.readyState === 'loading') {
   _bootHelpers();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ─── CAMPAIGNS: one list for every run + Pause / Resume / Stop / Delete / Copy
+// ════════════════════════════════════════════════════════════════════════════
+const CAMPAIGN_STATUS_COLOR = {
+  running: '#1f6feb', paused: '#d29922', queued: '#8957e5', pending: '#8957e5',
+  scheduled: '#8957e5', completed: '#238636', partial: '#9e6a03', failed: '#da3633',
+  stopped: '#8b949e', cancelled: '#8b949e'
+};
+
+function _campKey(key) {
+  return String(key == null ? '' : key).replace(/[^A-Za-z0-9:_-]/g, '');
+}
+
+function _campBadge(status) {
+  const color = CAMPAIGN_STATUS_COLOR[status] || '#8b949e';
+  return '<span style="background:' + color + ';color:#fff;border-radius:10px;padding:1px 8px;font-size:10.5px">' +
+    escapeHtml(status || '') + '</span>';
+}
+
+function _campBtn(taskKey, action, label, color) {
+  return '<button class="btn btn-sm" type="button" style="margin-left:6px;background:' + color +
+    ';color:#fff;border:none" onclick="campaignAction(\'' + _campKey(taskKey) + '\',\'' + action + '\')">' +
+    label + '</button>';
+}
+
+// Only the buttons a campaign actually allows are rendered: a finished run has
+// no Pause, a paused run has Resume, and so on.
+function _campActions(item) {
+  let out = '';
+  if (item.can_pause) out += _campBtn(item.task_key, 'pause', '⏸ Pause', '#d29922');
+  if (item.can_resume) out += _campBtn(item.task_key, 'resume', '▶ Resume', '#238636');
+  if (item.can_stop) out += _campBtn(item.task_key, 'stop', '⛔ Stop', '#da3633');
+  if (item.can_duplicate) out += _campBtn(item.task_key, 'duplicate', '📄 Duplicate', '#30363d');
+  if (item.can_delete) out += _campBtn(item.task_key, 'delete', '🗑 Delete', '#30363d');
+  return out;
+}
+
+function _campaignCard(c) {
+  const color = CAMPAIGN_STATUS_COLOR[c.status] || '#8b949e';
+  const pct = Math.max(0, Math.min(100, c.percent || 0));
+  const errs = (c.errors || []).length
+    ? '<div style="color:#f85149;font-size:11px;margin-top:4px">' + c.errors.map(escapeHtml).join('<br>') + '</div>' : '';
+  const when = c.scheduled_at
+    ? '<span style="color:#8957e5;margin-left:8px">🕐 ' + new Date(c.scheduled_at.replace(' ', 'T') + 'Z').toLocaleString() + '</span>' : '';
+  const owner = c.owner ? '<span style="color:#8b949e;margin-left:8px">👤 ' + escapeHtml(c.owner) + '</span>' : '';
+  const repeat = (c.repeat_interval > 0)
+    ? '<span style="color:#8b949e;font-size:11px;margin-left:8px">🔁 every ' + c.repeat_interval + 'h' +
+      (c.repeat_count > 0 ? ' · ' + c.repeat_count + ' left' : ' · ∞') + '</span>' : '';
+  const waiting = c.status === 'pending' || c.status === 'queued'
+    ? '<div style="font-size:11px;color:#8957e5;margin-top:3px">⏳ waiting to start — ' + c.total + ' target(s) queued</div>' : '';
+  return '<div class="card" style="padding:11px;margin-bottom:9px;border-left:3px solid ' + color + '">' +
+    '<div class="row" style="align-items:center;flex-wrap:wrap;gap:4px">' +
+      '<b>' + escapeHtml(c.kind_label || c.kind || 'Campaign') + '</b>' +
+      ' ' + _campBadge(c.status) +
+      '<span style="font-size:11.5px;color:#8b949e;margin-left:6px">' + escapeHtml(c.label || '') + '</span>' +
+      when + repeat + owner +
+    '</div>' +
+    '<div style="margin-top:6px;font-size:12px">' +
+      '✅ ' + (c.sent || 0) + ' sent &nbsp; ❌ ' + (c.failed || 0) + ' failed &nbsp; ⏭ ' + (c.skipped || 0) + ' skipped &nbsp;' +
+      '<span style="color:#8b949e">of ' + (c.total || 0) +
+      (c.remaining ? ' · ' + c.remaining + ' left' : '') +
+      (c.age_seconds != null ? ' · ' + _bcAge(c.age_seconds) : '') + '</span>' +
+    '</div>' +
+    '<div class="progress" style="margin-top:6px;background:#161b22;height:6px;border-radius:3px;overflow:hidden">' +
+      '<div style="width:' + pct + '%;background:' + color + ';height:6px"></div></div>' +
+    '<div style="font-size:11px;color:#8b949e;margin-top:3px">' + pct + '% done</div>' +
+    waiting + errs +
+    '<div class="row" style="margin-top:8px;flex-wrap:wrap">' + _campActions(c) + '</div>' +
+  '</div>';
+}
+
+async function campaignAction(taskKey, action) {
+  if (action === 'delete' && !confirm('Delete this campaign? A running one is stopped first.')) return;
+  if (action === 'duplicate' && !confirm('Duplicate this campaign and start sending to all targets now?')) return;
+  const base = '/bot/campaigns/' + encodeURIComponent(taskKey);
+  try {
+    const r = await fetch(base + (action === 'delete' ? '' : '/' + action), {
+      method: action === 'delete' ? 'DELETE' : 'POST', credentials: 'same-origin'
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) { data = null; }
+    const ok = r.ok && data && data.success;
+    const msg = (data && (data.message || data.error)) || ('HTTP ' + r.status);
+    if (typeof toast === 'function') toast(msg, ok ? 'success' : 'error');
+    const box = document.getElementById('campaignsAlert');
+    if (box) showAlert('campaignsAlert', msg, ok ? 'info' : 'error');
+  } catch (e) {
+    if (typeof toast === 'function') toast('Request failed: ' + e.message, 'error');
+  }
+  loadCampaigns(true);
+  if (typeof loadBroadcastCampaigns === 'function') loadBroadcastCampaigns();
+  if (typeof loadScheduled === 'function') loadScheduled();
+}
+
+function updateCampaignBadge(counts) {
+  const badge = document.getElementById('campaignNavBadge');
+  if (!badge) return;
+  const active = (counts && (counts.running || 0) + (counts.paused || 0)) || 0;
+  if (active > 0) { badge.style.display = 'inline-block'; badge.textContent = active; }
+  else { badge.style.display = 'none'; badge.textContent = ''; }
+}
+
+async function loadCampaigns(force) {
+  const box = document.getElementById('campaignsList');
+  const filter = document.getElementById('campaignKindFilter');
+  const kind = filter ? filter.value : '';
+  try {
+    const r = await fetch('/bot/campaigns' + (kind ? '?kind=' + encodeURIComponent(kind) : ''),
+                          { credentials: 'same-origin' });
+    const data = await r.json();
+    if (!data || !data.success) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    const counts = data.counts || {};
+    updateCampaignBadge(counts);
+    const chips = document.getElementById('campaignCounts');
+    if (chips) {
+      chips.innerHTML = '<b style="color:#1f6feb">' + (counts.running || 0) + ' running</b> · ' +
+        '<b style="color:#d29922">' + (counts.paused || 0) + ' paused</b> · ' +
+        '<b style="color:#8957e5">' + (counts.queued || 0) + ' waiting</b> · ' +
+        (counts.total || 0) + ' total';
+    }
+    if (!box) return;
+    const list = data.campaigns || [];
+    if (!list.length) {
+      box.innerHTML = '<div class="card" style="padding:18px;text-align:center;color:#8b949e;font-size:12.5px">' +
+        'No campaigns yet. Start a Broadcast, Bulk DM or DM Campaign — it will appear here with Pause / Duplicate / Delete.</div>';
+      return;
+    }
+    box.innerHTML = list.map(_campaignCard).join('');
+  } catch (e) {
+    if (box) box.innerHTML = '<span style="color:#f85149">Could not load campaigns: ' + escapeHtml(String(e.message || e)) + '</span>';
+  }
+}
+
+// 5 s heartbeat: the list refreshes only while the Campaigns page is open, so a
+// background tab never hammers the API; the sidebar counter still stays honest.
+(function campaignHeartbeat() {
+  let tick = 0;
+  setInterval(function () {
+    tick += 1;
+    const page = document.getElementById('page-campaigns');
+    const onPage = page && page.classList.contains('active');
+    const auto = document.getElementById('campaignAutoRefresh');
+    if (onPage && (!auto || auto.checked)) loadCampaigns(false);
+    else if (tick % 3 === 1 && typeof refreshCampaignBadge === 'function') refreshCampaignBadge();
+  }, 5000);
+})();
+
+async function refreshCampaignBadge() {
+  try {
+    const r = await fetch('/bot/campaigns', { credentials: 'same-origin' });
+    const data = await r.json();
+    if (data && data.success) updateCampaignBadge(data.counts || {});
+  } catch (e) { /* a failed badge refresh is never worth a popup */ }
+}
+
 // ── Broadcast campaign list (mirrors the Auto Posting Campaigns card) ────────
 function _bcBadge(status) {
-  const map = { running: ['#1f6feb', 'running'], completed: ['#238636', 'completed'],
+  const map = { running: ['#1f6feb', 'running'], paused: ['#d29922', 'paused'],
+                completed: ['#238636', 'completed'],
                 stopped: ['#8b949e', 'stopped'], partial: ['#9e6a03', 'partial'],
                 failed: ['#da3633', 'failed'] };
   const m = map[status] || ['#8b949e', status];
@@ -4234,11 +4442,7 @@ async function loadBroadcastCampaigns() {
         '<div class="progress" style="margin-top:6px"><div style="width:' + pct + '%;background:#1f6feb;height:6px;border-radius:3px"></div></div>' +
         '<div style="font-size:11px;color:#8b949e;margin-top:3px">' + pct + '% of this round</div>' +
         roundsLine + errs +
-        '<div class="row" style="margin-top:6px">' +
-          (c.status === 'running'
-            ? '<button class="btn btn-sm btn-gray" type="button" onclick="stopBroadcastCampaign(\'' + c.task_key + '\', ' + c.id + ')">⛔ Stop</button>' : '') +
-          '<button class="btn btn-sm btn-gray" type="button" style="margin-left:6px" onclick="deleteBroadcastCampaign(' + c.id + ')">🗑 Delete</button>' +
-        '</div>' +
+        '<div class="row" style="margin-top:6px;flex-wrap:wrap">' + _campActions(c) + '</div>' +
       '</div>';
     }).join('');
   } catch (e) {

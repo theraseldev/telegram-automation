@@ -1718,3 +1718,309 @@ def test_diag_reports_missing_columns_and_ok_status(app_client):
     assert payload['database']['missing_columns'] == []
     assert payload['status'] == 'ok'
     assert payload['environment']['SECRET_KEY_is_placeholder'] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Campaign control centre — the actions a user expects after pressing Start:
+# one list, Pause, Resume, Stop, Delete, Duplicate (message section + schedules)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import time
+
+
+def _uid():
+    with main.app.app_context():
+        return main.User.query.filter_by(username=TEST_USER).first().id
+
+
+def _key(kind='broadcast'):
+    return f'{kind}:{os.urandom(4).hex()}'
+
+
+def _make_run(kind='broadcast', task_key=None, status='running', total=4, cursor=0, sent=0,
+              paused=False, payload=None, label=None, user_id=None):
+    key = task_key or _key(kind)
+    with main.app.app_context():
+        main.db.session.add(main.TaskRun(
+            task_key=key, user_id=user_id or _uid(), kind=kind, status=status,
+            sent=sent, failed=0, skipped=0, total=total, cursor=cursor, paused=paused,
+            label=label or f'{kind} · {total} targets',
+            payload=json.dumps(payload) if payload else None,
+        ))
+        main.db.session.commit()
+    return key
+
+
+def _payload(account_id, targets, kind='broadcast', map_kind='groups', **extra):
+    data = {'kind': kind, 'account_id': account_id, 'map': map_kind, 'targets': targets,
+            'message_type': 'text', 'content': 'hello', 'caption': '', 'delay': 1}
+    data.update(extra)
+    return data
+
+
+def _wait_until(predicate, timeout=10.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def _send_log(fake_tg):
+    return [name for name, _kind in fake_tg.sent]
+
+
+# ── the list ────────────────────────────────────────────────────────────────
+
+def test_campaign_list_reports_progress_and_available_actions(user_client, account):
+    targets = ['g1', 'g2', 'g3', 'g4', 'g5', 'g6']
+    key = _make_run(total=6, cursor=2, sent=2, payload=_payload(account, targets))
+    data = user_client.get('/bot/campaigns').get_json()
+    assert data['success'] is True
+    item = next(c for c in data['campaigns'] if c['task_key'] == key)
+    assert item['status'] == 'running'
+    assert item['percent'] == 33 and item['remaining'] == 4
+    assert item['can_pause'] and item['can_stop'] and item['can_delete'] and item['can_duplicate']
+    assert item['can_resume'] is False
+    assert data['counts']['running'] >= 1
+    assert item['kind_label']
+
+
+def test_campaign_list_requires_login(app_client):
+    app_client.get('/logout')
+    r = app_client.get('/bot/campaigns')
+    assert r.status_code in (302, 303, 401)
+    assert app_client.post('/bot/campaigns/anything/pause').status_code in (302, 303, 401)
+
+
+# ── pause / resume ──────────────────────────────────────────────────────────
+
+def test_pause_flag_makes_the_worker_stop_before_the_next_target(user_client, account, fake_tg):
+    targets = ['g1', 'g2', 'g3']
+    key = _make_run(total=3, payload=_payload(account, targets))
+    assert user_client.post(f'/bot/campaigns/{key}/pause').status_code == 200
+    main.campaign_worker(key, _payload(account, targets), 0)
+    assert _send_log(fake_tg) == []
+    row = main.campaign_row(key)
+    assert row.status == 'paused' and row.paused is True and row.cursor == 0
+
+
+def test_worker_pauses_between_targets_and_saves_the_cursor(user_client, account, fake_tg, monkeypatch):
+    targets = ['g1', 'g2', 'g3']
+    key = _make_run(total=3, payload=_payload(account, targets))
+    calls = {'n': 0}
+    real = main.campaign_control
+
+    def pause_after_first(key_):
+        calls['n'] += 1
+        return None if calls['n'] <= 1 else 'pause'
+
+    monkeypatch.setattr(main, 'campaign_control', pause_after_first)
+    main.campaign_worker(key, _payload(account, targets), 0)
+    monkeypatch.setattr(main, 'campaign_control', real)
+
+    assert _send_log(fake_tg) == ['g1']
+    row = main.campaign_row(key)
+    assert row.status == 'paused' and row.cursor == 1 and row.sent == 1
+
+
+def test_resume_sends_only_the_targets_that_were_not_sent(user_client, account, fake_tg):
+    targets = ['g1', 'g2', 'g3', 'g4']
+    key = _make_run(total=4, cursor=2, sent=2, status='paused', paused=True,
+                    payload=_payload(account, targets))
+    r = user_client.post(f'/bot/campaigns/{key}/resume')
+    assert r.status_code == 200, r.get_json()
+    assert _wait_until(lambda: main.campaign_row(key).status != 'running')
+    assert _send_log(fake_tg) == ['g3', 'g4']
+    row = main.campaign_row(key)
+    assert row.status == 'completed' and row.sent == 4 and row.cursor == 4
+
+
+def test_resume_refuses_a_campaign_with_nothing_left(user_client, account, fake_tg):
+    targets = ['g1']
+    key = _make_run(total=1, cursor=1, sent=1, status='paused', paused=True,
+                    payload=_payload(account, targets))
+    r = user_client.post(f'/bot/campaigns/{key}/resume')
+    assert r.status_code == 409
+    assert _send_log(fake_tg) == []
+
+
+def test_pause_refuses_a_finished_campaign(user_client, account):
+    key = _make_run(status='completed', cursor=4, sent=4)
+    assert user_client.post(f'/bot/campaigns/{key}/pause').status_code == 409
+
+
+# ── stop / delete / duplicate ───────────────────────────────────────────────
+
+def test_stop_on_a_paused_campaign_marks_it_stopped(user_client, account):
+    key = _make_run(status='paused', paused=True, cursor=1, sent=1)
+    assert user_client.post(f'/bot/campaigns/{key}/stop').status_code == 200
+    row = main.campaign_row(key)
+    assert row.status == 'stopped' and row.stop_requested is True and row.paused is False
+
+
+def test_stop_refuses_a_finished_campaign(user_client, account):
+    key = _make_run(status='completed', cursor=2, sent=2)
+    r = user_client.post(f'/bot/campaigns/{key}/stop')
+    assert r.status_code == 409
+
+
+def test_delete_removes_the_campaign_and_its_source_row(user_client, account):
+    with main.app.app_context():
+        task = main.BroadcastTask(user_id=_uid(), account_id=account, message_type='text',
+                                  content='x', groups=json.dumps(['g1']), delay=1, status='failed')
+        main.db.session.add(task)
+        main.db.session.commit()
+        task_id = task.id
+    key = _make_run(task_key=f'broadcast:{task_id}', status='failed', total=1, cursor=1, sent=1)
+    assert user_client.delete(f'/bot/campaigns/{key}').status_code == 200
+    assert main.campaign_row(key) is None
+    with main.app.app_context():
+        assert main.BroadcastTask.query.get(task_id) is None
+
+
+def test_duplicate_starts_a_new_campaign_with_the_same_targets(user_client, account, fake_tg):
+    targets = ['g1', 'g2']
+    key = _make_run(status='completed', total=2, cursor=2, sent=2,
+                    payload=_payload(account, targets))
+    r = user_client.post(f'/bot/campaigns/{key}/duplicate')
+    data = r.get_json()
+    assert r.status_code == 200 and data['success'] and data['task_key'] != key
+    copy_key = data['task_key']
+    assert _wait_until(lambda: main.campaign_row(copy_key).status != 'running')
+    assert _send_log(fake_tg) == ['g1', 'g2']
+    copy = main.campaign_row(copy_key)
+    assert copy.status == 'completed' and copy.total == 2 and 'Copy of' in (copy.label or '')
+
+
+def test_duplicate_needs_saved_settings(user_client, account):
+    key = _make_run(status='completed', cursor=2, sent=2, payload=None)
+    assert user_client.post(f'/bot/campaigns/{key}/duplicate').status_code == 409
+
+
+# ── scheduled broadcasts (before they fire) ─────────────────────────────────
+
+def _make_schedule(account_id, minutes=30):
+    with main.app.app_context():
+        sb = main.ScheduledBroadcast(
+            user_id=_uid(), account_id=account_id, message_type='text', content='scheduled hi',
+            groups=json.dumps(['g1', 'g2']), delay=1,
+            scheduled_at=main.datetime.utcnow() + main.timedelta(minutes=minutes),
+            status='pending',
+        )
+        main.db.session.add(sb)
+        main.db.session.commit()
+        return sb.id
+
+
+def test_schedule_appears_in_the_list_with_pause_and_delete(user_client, account):
+    sb_id = _make_schedule(account)
+    data = user_client.get('/bot/campaigns').get_json()
+    item = next(c for c in data['campaigns'] if c['task_key'] == f'sched:{sb_id}')
+    assert item['kind'] == 'schedule' and item['status'] == 'pending'
+    assert item['can_pause'] and item['can_delete'] and item['can_duplicate']
+    assert item['total'] == 2
+
+
+def test_schedule_pause_resume_and_delete(user_client, account):
+    sb_id = _make_schedule(account)
+    key = f'sched:{sb_id}'
+
+    assert user_client.post(f'/bot/campaigns/{key}/pause').status_code == 200
+    with main.app.app_context():
+        assert main.ScheduledBroadcast.query.get(sb_id).status == 'paused'
+
+    assert user_client.post(f'/bot/campaigns/{key}/resume').status_code == 200
+    with main.app.app_context():
+        assert main.ScheduledBroadcast.query.get(sb_id).status == 'pending'
+
+    assert user_client.post(f'/bot/campaigns/{key}/pause').status_code == 200
+    assert user_client.delete(f'/bot/campaigns/{key}').status_code == 200
+    with main.app.app_context():
+        assert main.ScheduledBroadcast.query.get(sb_id) is None
+
+
+def test_schedule_duplicate_copies_it_instead_of_running_it(user_client, account):
+    sb_id = _make_schedule(account)
+    r = user_client.post(f'/bot/campaigns/sched:{sb_id}/duplicate')
+    data = r.get_json()
+    assert r.status_code == 200 and data['success']
+    with main.app.app_context():
+        original = main.ScheduledBroadcast.query.get(sb_id)
+        copy = main.ScheduledBroadcast.query.get(int(data['task_key'].split(':')[1]))
+        assert original.status == 'pending'          # untouched
+        assert copy.content == original.content and copy.status == 'pending'
+
+
+# ── ownership ───────────────────────────────────────────────────────────────
+
+def test_another_users_campaign_cannot_be_controlled(user_client, account):
+    with main.app.app_context():
+        other = main.User(username='other-owner-%s' % os.urandom(3).hex(),
+                          password=main.generate_password_hash('x'))
+        main.db.session.add(other)
+        main.db.session.commit()
+        other_id = other.id
+    key = _make_run(total=2, payload=_payload(account, ['g1', 'g2']), user_id=other_id)
+    assert user_client.post(f'/bot/campaigns/{key}/pause').status_code == 403
+    assert user_client.post(f'/bot/campaigns/{key}/stop').status_code == 403
+    assert user_client.delete(f'/bot/campaigns/{key}').status_code == 403
+    assert user_client.post(f'/bot/campaigns/{key}/duplicate').status_code == 403
+
+
+# ── media upload used by the message forms ──────────────────────────────────
+
+def test_upload_media_stores_a_photo_and_returns_the_ui_contract(user_client):
+    r = user_client.post('/bot/upload_media',
+                         data={'file': (io.BytesIO(b'\x89PNG\r\n\x1a\n' + b'0' * 128), 'photo.png')},
+                         content_type='multipart/form-data')
+    assert r.status_code == 200, r.data[:300]
+    f = r.get_json()['file']
+    assert f['kind'] == 'photo' and f['size'] > 0 and f['original_name'] == 'photo.png'
+    assert os.path.exists(f['path'])
+    assert user_client.get(f['url']).status_code == 200
+
+
+def test_upload_media_rejects_executables(user_client):
+    r = user_client.post('/bot/upload_media',
+                         data={'file': (io.BytesIO(b'MZ'), 'payload.exe')},
+                         content_type='multipart/form-data')
+    assert r.status_code == 400
+    assert 'Unsupported' in r.get_json()['error']
+
+
+def test_upload_media_requires_login_and_a_file(app_client):
+    app_client.get('/logout')
+    assert app_client.post('/bot/upload_media').status_code in (302, 303, 401)
+
+
+# ── backwards-compatible broadcast card endpoints ───────────────────────────
+
+def test_broadcast_campaigns_card_contract(user_client, account):
+    with main.app.app_context():
+        task = main.BroadcastTask(user_id=_uid(), account_id=account, message_type='text',
+                                  content='hi', groups=json.dumps(['g1', 'g2']), delay=1,
+                                  status='running')
+        main.db.session.add(task)
+        main.db.session.commit()
+        task_id = task.id
+    key = _make_run(task_key=f'broadcast:{task_id}', total=2, cursor=1, sent=1,
+                    payload=_payload(account, ['g1', 'g2']))
+
+    data = user_client.get('/bot/broadcast/campaigns').get_json()
+    item = next(c for c in data['campaigns'] if c['task_key'] == key)
+    assert item['id'] == task_id and item['sent'] == 1 and item['total'] == 2
+    assert item['can_pause'] is True and item['can_stop'] is True
+
+    assert user_client.delete(f'/bot/broadcast/campaigns/{task_id}').status_code == 200
+    with main.app.app_context():
+        assert main.BroadcastTask.query.get(task_id) is None
+
+
+def test_stop_endpoint_used_by_inline_stop_buttons(user_client, account):
+    key = _make_run(total=2, cursor=0, payload=_payload(account, ['g1', 'g2']))
+    r = user_client.post(f'/bot/task/{key}/stop')
+    assert r.status_code == 200 and r.get_json()['success'] is True
+    row = main.campaign_row(key)
+    assert row.stop_requested is True
